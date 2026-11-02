@@ -1,0 +1,8 @@
+{
+  "name": "trading-app",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node dev.js"
+  }
+}
