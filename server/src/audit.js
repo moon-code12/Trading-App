@@ -15,8 +15,8 @@ export function sanitizeDetails(value, depth = 0) {
 }
 
 // Records one action by the signed-in administrator (req.user) against a target.
-export function recordAudit(db, req, now, { action, targetType = null, targetId = null, details = null }) {
-  db.prepare('INSERT INTO admin_audit (admin_id, admin_email, action, target_type, target_id, details, ip, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+export async function recordAudit(db, req, now, { action, targetType = null, targetId = null, details = null }) {
+  await db.prepare('INSERT INTO admin_audit (admin_id, admin_email, action, target_type, target_id, details, ip, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
     .run(req.user.id, req.user.email, action, targetType, targetId === null ? null : String(targetId),
       details === null ? null : JSON.stringify(sanitizeDetails(details)), String(req.ip || '').replace(/^::ffff:/, ''), now);
 }
@@ -27,7 +27,7 @@ const shape = (r) => ({
 });
 
 // Filters: admin (id), action (exact, or a prefix ending in '.'), targetType, targetId, from, to (ms). Newest first.
-export function queryAudit(db, { admin, action, targetType, targetId, from, to, limit = 100, offset = 0 } = {}) {
+export async function queryAudit(db, { admin, action, targetType, targetId, from, to, limit = 100, offset = 0 } = {}) {
   const where = [];
   const args = [];
   if (admin !== undefined) { where.push('admin_id = ?'); args.push(admin); }
@@ -39,7 +39,7 @@ export function queryAudit(db, { admin, action, targetType, targetId, from, to, 
   if (from !== undefined) { where.push('created_at >= ?'); args.push(from); }
   if (to !== undefined) { where.push('created_at <= ?'); args.push(to); }
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
-  const total = db.prepare(`SELECT COUNT(*) AS n FROM admin_audit ${clause}`).get(...args).n;
-  const rows = db.prepare(`SELECT * FROM admin_audit ${clause} ORDER BY id DESC LIMIT ? OFFSET ?`).all(...args, limit, offset);
+  const total = (await db.prepare(`SELECT COUNT(*) AS n FROM admin_audit ${clause}`).get(...args)).n;
+  const rows = await db.prepare(`SELECT * FROM admin_audit ${clause} ORDER BY id DESC LIMIT ? OFFSET ?`).all(...args, limit, offset);
   return { total, entries: rows.map(shape) };
 }

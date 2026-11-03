@@ -53,7 +53,7 @@ test('catalogue: one new entry flows through search, categories, stats, status, 
   assert.ok(snap.volume24h > 0 && snap.high24h >= snap.low24h);
   assert.equal(snapshot(getAsset('US10Y'), Date.parse('2026-03-14T12:00:00Z')).market.open, true);
 
-  const db = openDb(':memory:');
+  const db = await openDb(':memory:');
   const server = createApp(db, { secret: 's', log: () => {} }).listen(0);
   const base = `http://localhost:${server.address().port}/api`;
   try {
@@ -68,7 +68,7 @@ test('catalogue: one new entry flows through search, categories, stats, status, 
     assert.ok((await get('/markets/meta')).categories.some((c) => c.id === 'bonds' && c.count === 1));
     assert.equal((await get('/markets/compare?a=NVDA&b=AAPL')).assets.length, 2);
     assert.ok((await get('/markets/discovery?limit=10')).active.some((a) => a.symbol === 'NVDA' || a.symbol === 'US10Y' || a.symbol === 'AAPL'));
-    const bought = placeOrder(db, { id: reg.user.id }, { symbol: 'NVDA', side: 'buy', type: 'market', quantity: 2 }, Date.now(), { confirmLarge: true });
+    const bought = await placeOrder(db, { id: reg.user.id }, { symbol: 'NVDA', side: 'buy', type: 'market', quantity: 2 }, Date.now(), { confirmLarge: true });
     assert.equal(bought.order.status, 'filled');
     const m = await get('/markets/NVDA');
     assert.equal(m.asset.symbol, 'NVDA');
