@@ -47,36 +47,36 @@ const DAY = 24 * 3600e3;
 const sqlTime = (ms) => new Date(ms).toISOString().replace('T', ' ').replace('Z', '');
 
 // Builds an account with a hand-written ledger so expected numbers are known exactly.
-function seed(now, trades, flows = []) {
-  const db = openDb(':memory:');
+async function seed(now, trades, flows = []) {
+  const db = await openDb(':memory:');
   const created = now - 10 * DAY;
   const cashDelta = trades.reduce((s, t) => s + (t.side === 'buy' ? -1 : 1) * t.qty * t.price, 0) + flows.reduce((s, f) => s + f.amount, 0);
-  const uid = db.prepare("INSERT INTO users (name, email, password_hash, balance, created_at) VALUES ('T', 't@x.com', 'x', ?, ?)")
-    .run(10000 + cashDelta, sqlTime(created)).lastInsertRowid;
+  const uid = (await db.prepare("INSERT INTO users (name, email, password_hash, balance, created_at) VALUES ('T', 't@x.com', 'x', ?, ?)")
+    .run(10000 + cashDelta, sqlTime(created))).lastInsertRowid;
   const addOrder = db.prepare("INSERT INTO orders (user_id, symbol, side, type, quantity, status, fill_price, filled_at) VALUES (?, ?, ?, 'market', ?, 'filled', ?, ?)");
   const addFill = db.prepare('INSERT INTO fills (order_id, user_id, symbol, side, quantity, price, filled_at) VALUES (?, ?, ?, ?, ?, ?, ?)');
   const addTx = db.prepare('INSERT INTO transactions (user_id, type, symbol, amount, note, order_id, fill_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
   const events = [
-    ...trades.map((t) => ({ at: t.at, run: () => {
-      const oid = addOrder.run(uid, t.symbol, t.side, t.qty, t.price, sqlTime(t.at)).lastInsertRowid;
-      const fid = addFill.run(oid, uid, t.symbol, t.side, t.qty, t.price, sqlTime(t.at)).lastInsertRowid;
+    ...trades.map((t) => ({ at: t.at, run: async () => {
+      const oid = (await addOrder.run(uid, t.symbol, t.side, t.qty, t.price, sqlTime(t.at))).lastInsertRowid;
+      const fid = (await addFill.run(oid, uid, t.symbol, t.side, t.qty, t.price, sqlTime(t.at))).lastInsertRowid;
       const amount = (t.side === 'buy' ? -1 : 1) * t.qty * t.price;
-      addTx.run(uid, t.side, t.symbol, amount, `${t.qty} ${t.symbol} @ ${t.price}`, oid, fid, sqlTime(t.at));
+      await addTx.run(uid, t.side, t.symbol, amount, `${t.qty} ${t.symbol} @ ${t.price}`, oid, fid, sqlTime(t.at));
     } })),
-    ...flows.map((f) => ({ at: f.at, run: () => addTx.run(uid, f.amount > 0 ? 'deposit' : 'withdrawal', null, f.amount, 'Demo', null, null, sqlTime(f.at)) })),
+    ...flows.map((f) => ({ at: f.at, run: async () => await addTx.run(uid, f.amount > 0 ? 'deposit' : 'withdrawal', null, f.amount, 'Demo', null, null, sqlTime(f.at)) })),
   ].sort((a, b) => a.at - b.at);
   events.forEach((e) => e.run());
   return { db, user: { id: uid } };
 }
 
-test('analytics: average cost, realized and unrealized P/L, returns', () => {
+test('analytics: average cost, realized and unrealized P/L, returns', async () => {
   const now = Date.parse('2026-06-15T12:00:00Z');
-  const { db, user } = seed(now, [
+  const { db, user } = await seed(now, [
     { at: now - 5 * DAY, symbol: 'ETH', side: 'buy', qty: 2, price: 3000 },
     { at: now - 4 * DAY, symbol: 'ETH', side: 'buy', qty: 1, price: 3300 },
     { at: now - 2 * DAY, symbol: 'ETH', side: 'sell', qty: 1, price: 3500 },
   ], [{ at: now - 3 * DAY, amount: 1000 }]);
-  const a = computeAnalytics(db, user, now);
+  const a = await computeAnalytics(db, user, now);
   const P = priceAt(getAsset('ETH'), now);
 
   assert.equal(a.mode, 'demo');
@@ -105,12 +105,12 @@ test('analytics: average cost, realized and unrealized P/L, returns', () => {
   near(a.allocation.reduce((t, x) => t + x.pct, 0), 100, 0.01);
 });
 
-test('analytics: performance periods and portfolio-value history', () => {
+test('analytics: performance periods and portfolio-value history', async () => {
   const now = Date.parse('2026-06-15T12:00:00Z');
-  const { db, user } = seed(now, [
+  const { db, user } = await seed(now, [
     { at: now - 5 * DAY, symbol: 'ETH', side: 'buy', qty: 2, price: 3000 },
   ], [{ at: now - 3 * DAY, amount: 1000 }]);
-  const a = computeAnalytics(db, user, now);
+  const a = await computeAnalytics(db, user, now);
   const eth = getAsset('ETH');
   const P = priceAt(eth, now);
 
@@ -132,19 +132,19 @@ test('analytics: performance periods and portfolio-value history', () => {
   assert.equal(Date.parse(all.since), now - 10 * DAY);
 });
 
-test('analytics: best and worst holdings, and an account with no trades', () => {
+test('analytics: best and worst holdings, and an account with no trades', async () => {
   const now = Date.parse('2026-06-15T12:00:00Z');
-  const { db, user } = seed(now, [
+  const { db, user } = await seed(now, [
     { at: now - 2 * DAY, symbol: 'ETH', side: 'buy', qty: 1, price: 6000 }, // deep loss
     { at: now - 2 * DAY, symbol: 'AAPL', side: 'buy', qty: 10, price: 50 }, // big gain
   ]);
-  const a = computeAnalytics(db, user, now);
+  const a = await computeAnalytics(db, user, now);
   assert.equal(a.best.symbol, 'AAPL');
   assert.equal(a.worst.symbol, 'ETH');
   assert.ok(a.best.unrealizedPct > 0 && a.worst.unrealizedPct < 0);
 
-  const empty = seed(now, []);
-  const e = computeAnalytics(empty.db, empty.user, now);
+  const empty = await seed(now, []);
+  const e = await computeAnalytics(empty.db, empty.user, now);
   assert.deepEqual(e.holdings, []);
   assert.equal(e.best, null);
   assert.equal(e.worst, null);
@@ -153,7 +153,7 @@ test('analytics: best and worst holdings, and an account with no trades', () => 
 });
 
 test('API: analytics agrees with fills, and the CSV statement is demo-labelled', async () => {
-  const db = openDb(':memory:');
+  const db = await openDb(':memory:');
   const server = createApp(db, { secret: 's', log: () => {} }).listen(0);
   const base = `http://localhost:${server.address().port}/api`;
   try {
@@ -189,6 +189,6 @@ test('API: analytics agrees with fills, and the CSV statement is demo-labelled',
     assert.equal(sell[1], 'sell');
     near(Number(sell[6]), (s1.fill_price - avg) * 10, 1e-3);
     assert.equal((await fetch(`${base}/transactions/export`)).status, 401);
-    assert.equal(buildStatement(db, { id: reg.user.id }).split('\r\n')[0].split(',').length, 10);
+    assert.equal((await buildStatement(db, { id: reg.user.id })).split('\r\n')[0].split(',').length, 10);
   } finally { server.close(); }
 });

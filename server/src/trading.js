@@ -36,21 +36,8 @@ export class OrderError extends Error {
 }
 const fail = (msg, opts) => { throw new OrderError(msg, opts); };
 
-// Nested-safe transaction: SAVEPOINTs work at the top level and inside other savepoints.
-let spCounter = 0;
-export function atomic(db, fn) {
-  const name = `sp_${++spCounter}`;
-  db.exec(`SAVEPOINT ${name}`);
-  try {
-    const result = fn();
-    db.exec(`RELEASE ${name}`);
-    return result;
-  } catch (e) {
-    db.exec(`ROLLBACK TO ${name}`);
-    db.exec(`RELEASE ${name}`);
-    throw e;
-  }
-}
+// Nested-safe transaction: a real transaction at the top level, savepoints inside it.
+export const atomic = (db, fn) => db.transaction(fn);
 
 const sqlTime = (ms) => new Date(ms).toISOString().replace('T', ' ').replace('Z', '');
 export const dayStart = (now) => Math.floor(now / DAY_MS) * DAY_MS;
@@ -60,18 +47,18 @@ const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : NaN);
 
 // ---------------------------------------------------------------- risk settings
 
-export function lossState(db, userId, now = Date.now(), { full = false } = {}) {
-  const u = db.prepare('SELECT daily_loss_limit FROM users WHERE id = ?').get(userId);
+export async function lossState(db, userId, now = Date.now(), { full = false } = {}) {
+  const u = await db.prepare('SELECT daily_loss_limit FROM users WHERE id = ?').get(userId);
   if (u.daily_loss_limit === null && !full) return { limit: null, loss: 0, pnl: 0, reached: false };
-  const { pnl } = performanceSince(db, { id: userId }, dayStart(now), now);
+  const { pnl } = await performanceSince(db, { id: userId }, dayStart(now), now);
   const loss = Math.max(0, r2(-pnl));
   const limit = u.daily_loss_limit;
   return { limit, loss, pnl: r2(pnl), reached: limit !== null && loss >= limit - EPS };
 }
 
-export function riskSettings(db, userId, now = Date.now()) {
-  const u = db.prepare('SELECT daily_loss_limit, max_order_pct, large_order_pct FROM users WHERE id = ?').get(userId);
-  const state = lossState(db, userId, now, { full: true });
+export async function riskSettings(db, userId, now = Date.now()) {
+  const u = await db.prepare('SELECT daily_loss_limit, max_order_pct, large_order_pct FROM users WHERE id = ?').get(userId);
+  const state = await lossState(db, userId, now, { full: true });
   return {
     dailyLossLimit: u.daily_loss_limit, maxOrderPct: u.max_order_pct, largeOrderPct: u.large_order_pct,
     todayLoss: state.loss, todayPnl: state.pnl, limitReached: state.reached,
@@ -79,19 +66,19 @@ export function riskSettings(db, userId, now = Date.now()) {
   };
 }
 
-export function updateRiskSettings(db, userId, { dailyLossLimit, maxOrderPct, largeOrderPct }, now = Date.now()) {
-  if (dailyLossLimit !== undefined) db.prepare('UPDATE users SET daily_loss_limit = ? WHERE id = ?').run(dailyLossLimit, userId);
-  if (maxOrderPct !== undefined) db.prepare('UPDATE users SET max_order_pct = ? WHERE id = ?').run(maxOrderPct, userId);
-  if (largeOrderPct !== undefined) db.prepare('UPDATE users SET large_order_pct = ? WHERE id = ?').run(largeOrderPct, userId);
-  return riskSettings(db, userId, now);
+export async function updateRiskSettings(db, userId, { dailyLossLimit, maxOrderPct, largeOrderPct }, now = Date.now()) {
+  if (dailyLossLimit !== undefined) await db.prepare('UPDATE users SET daily_loss_limit = ? WHERE id = ?').run(dailyLossLimit, userId);
+  if (maxOrderPct !== undefined) await db.prepare('UPDATE users SET max_order_pct = ? WHERE id = ?').run(maxOrderPct, userId);
+  if (largeOrderPct !== undefined) await db.prepare('UPDATE users SET large_order_pct = ? WHERE id = ?').run(largeOrderPct, userId);
+  return await riskSettings(db, userId, now);
 }
 
 // ---------------------------------------------------------------- reservations
 
 // Cash and shares already committed to working orders. An OCO pair can only fill one
 // leg, so a group counts once (its largest leg).
-function reserved(db, uid) {
-  const rows = db.prepare(`SELECT * FROM orders WHERE user_id = ? AND ${WORKING}`).all(uid);
+async function reserved(db, uid) {
+  const rows = await db.prepare(`SELECT * FROM orders WHERE user_id = ? AND ${WORKING}`).all(uid);
   const groups = new Map();
   let cash = 0;
   const shares = {};
@@ -109,8 +96,8 @@ function reserved(db, uid) {
   return { cash, shares };
 }
 
-function portfolioValue(db, uid, balance, now) {
-  const held = db.prepare('SELECT symbol, quantity FROM holdings WHERE user_id = ?').all(uid)
+async function portfolioValue(db, uid, balance, now) {
+  const held = (await db.prepare('SELECT symbol, quantity FROM holdings WHERE user_id = ?').all(uid))
     .reduce((s, h) => s + h.quantity * priceAt(getAsset(h.symbol), now), 0);
   return balance + held;
 }
@@ -201,7 +188,7 @@ function checkCommon(spec) {
 }
 
 // Validates and prices one order or an OCO pair without writing anything.
-function plan(db, user, spec, now) {
+async function plan(db, user, spec, now) {
   checkCommon(spec);
   const asset = getAsset(spec.symbol);
   if (!asset) fail('Unknown asset');
@@ -219,25 +206,25 @@ function plan(db, user, spec, now) {
   const legs = legSpecs.map((l) => normalizeLeg(l, spec.side, spec.quantity, p, asset));
   if (spec.legs && legs.some((l) => triggersNow(l, p))) fail('Each OCO leg must rest away from the current price, otherwise it would fill immediately');
 
-  const user0 = db.prepare('SELECT * FROM users WHERE id = ?').get(user.id);
+  const user0 = await db.prepare('SELECT * FROM users WHERE id = ?').get(user.id);
   if (user0.suspended_at) fail('Your account is suspended, so you cannot trade. Contact support for help', { status: 403, code: 'ACCOUNT_SUSPENDED' });
-  const held = reserved(db, user.id);
+  const held = await reserved(db, user.id);
   const buy = spec.side === 'buy';
   const needCash = Math.max(...legs.map((l) => (buy ? spec.quantity * l.reserve_price : 0)));
   if (buy && r2(needCash) > r2(user0.balance - held.cash)) fail('Insufficient funds');
   if (!buy) {
-    const h = db.prepare('SELECT quantity FROM holdings WHERE user_id = ? AND symbol = ?').get(user.id, spec.symbol);
+    const h = await db.prepare('SELECT quantity FROM holdings WHERE user_id = ? AND symbol = ?').get(user.id, spec.symbol);
     const free = (h?.quantity ?? 0) - (held.shares[spec.symbol] ?? 0);
     if (spec.quantity > free + EPS) fail('Insufficient holdings');
   }
 
-  const loss = lossState(db, user.id, now);
+  const loss = await lossState(db, user.id, now);
   if (buy && loss.reached) {
     fail(`Daily demo-loss limit reached (${loss.loss.toFixed(2)} of ${loss.limit.toFixed(2)}). New buy orders are paused until the next UTC day`, { status: 403, code: 'DAILY_LOSS_LIMIT' });
   }
 
   const notional = spec.quantity * (buy ? Math.max(...legs.map((l) => l.reserve_price)) : p);
-  const total = portfolioValue(db, user.id, user0.balance, now);
+  const total = await portfolioValue(db, user.id, user0.balance, now);
   const pct = total > 0 ? (notional / total) * 100 : 100;
   const warnings = [];
   if (pct > user0.max_order_pct) {
@@ -272,8 +259,8 @@ function plan(db, user, spec, now) {
   };
 }
 
-export function previewOrder(db, user, spec, now = Date.now()) {
-  const pl = plan(db, user, spec, now);
+export async function previewOrder(db, user, spec, now = Date.now()) {
+  const pl = await plan(db, user, spec, now);
   return {
     estimate: pl.estimate, warnings: pl.warnings, requiresConfirmation: pl.requiresConfirmation,
     timeInForce: pl.tif, expiresAt: pl.tifExpiresAt ? new Date(pl.tifExpiresAt).toISOString() : null,
@@ -286,42 +273,42 @@ export function previewOrder(db, user, spec, now = Date.now()) {
 const INSERT = `INSERT INTO orders (user_id, symbol, side, type, quantity, price, status, limit_price, trail_mode, trail_value,
   peak_price, tif, expires_at, oco_group, reserve_price) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)`;
 
-export function placeOrder(db, user, spec, now = Date.now(), { confirmLarge = false } = {}) {
-  const pl = plan(db, user, spec, now);
+export async function placeOrder(db, user, spec, now = Date.now(), { confirmLarge = false } = {}) {
+  const pl = await plan(db, user, spec, now);
   if (pl.requiresConfirmation && !confirmLarge) {
     fail('This is a large order. Please confirm it to continue', {
       status: 409, code: 'LARGE_ORDER_CONFIRMATION_REQUIRED', details: { warnings: pl.warnings, estimate: pl.estimate },
     });
   }
-  const ids = atomic(db, () => {
-    const insert = (f, group) => {
-      const id = db.prepare(INSERT).run(
+  const ids = await atomic(db, async () => {
+    const insert = async (f, group) => {
+      const id = (await db.prepare(INSERT).run(
         user.id, spec.symbol, f.side, f.type, f.quantity, f.price, f.limit_price, f.trail_mode, f.trail_value,
         f.peak_price, pl.tif, pl.tifExpiresAt, group, f.reserve_price,
-      ).lastInsertRowid;
+      )).lastInsertRowid;
       // The order takes a moment to reach the (simulated) market.
       const delay = latencyMs(pl.asset, id);
-      if (delay) db.prepare('UPDATE orders SET execute_after = ? WHERE id = ?').run(now + delay, id);
+      if (delay) await db.prepare('UPDATE orders SET execute_after = ? WHERE id = ?').run(now + delay, id);
       return id;
     };
-    if (pl.legs.length === 1) return [insert(pl.legs[0], null)];
-    const a = insert(pl.legs[0], null);
-    const b = insert(pl.legs[1], a);
-    db.prepare('UPDATE orders SET oco_group = ? WHERE id = ?').run(a, a);
+    if (pl.legs.length === 1) return [await insert(pl.legs[0], null)];
+    const a = await insert(pl.legs[0], null);
+    const b = await insert(pl.legs[1], a);
+    await db.prepare('UPDATE orders SET oco_group = ? WHERE id = ?').run(a, a);
     return [a, b];
   });
-  if (pl.legs.length === 1) processOrder(db, ids[0], now);
-  const rows = ids.map((id) => db.prepare('SELECT * FROM orders WHERE id = ?').get(id));
+  if (pl.legs.length === 1) await processOrder(db, ids[0], now);
+  const rows = await Promise.all(ids.map(async (id) => await db.prepare('SELECT * FROM orders WHERE id = ?').get(id)));
   return { order: rows[0], orders: rows, warnings: pl.warnings, estimate: pl.estimate };
 }
 
-export function cancelOrder(db, userId, id) {
-  const o = db.prepare(`SELECT * FROM orders WHERE id = ? AND user_id = ? AND ${WORKING}`).get(id, userId);
+export async function cancelOrder(db, userId, id) {
+  const o = await db.prepare(`SELECT * FROM orders WHERE id = ? AND user_id = ? AND ${WORKING}`).get(id, userId);
   if (!o) return null;
-  return atomic(db, () => {
+  return await atomic(db, async () => {
     const targets = o.oco_group === null ? [o.id]
-      : db.prepare(`SELECT id FROM orders WHERE oco_group = ? AND ${WORKING}`).all(o.oco_group).map((r) => r.id);
-    for (const t of targets) db.prepare("UPDATE orders SET status = 'cancelled', note = 'Cancelled by you' WHERE id = ?").run(t);
+      : (await db.prepare(`SELECT id FROM orders WHERE oco_group = ? AND ${WORKING}`).all(o.oco_group)).map((r) => r.id);
+    for (const t of targets) await db.prepare("UPDATE orders SET status = 'cancelled', note = 'Cancelled by you' WHERE id = ?").run(t);
     return targets;
   });
 }
@@ -356,78 +343,78 @@ function evaluate(o, p) {
   return { ready, patch };
 }
 
-function persist(db, id, patch) {
+async function persist(db, id, patch) {
   const keys = Object.keys(patch);
   if (!keys.length) return;
-  db.prepare(`UPDATE orders SET ${keys.map((k) => `${k} = ?`).join(', ')} WHERE id = ?`).run(...keys.map((k) => patch[k]), id);
+  await db.prepare(`UPDATE orders SET ${keys.map((k) => `${k} = ?`).join(', ')} WHERE id = ?`).run(...keys.map((k) => patch[k]), id);
 }
 
-function cancelSiblings(db, o, reason) {
+async function cancelSiblings(db, o, reason) {
   if (o.oco_group === null) return;
-  const sibs = db.prepare(`SELECT id FROM orders WHERE oco_group = ? AND id != ? AND ${WORKING}`).all(o.oco_group, o.id);
-  for (const s of sibs) db.prepare("UPDATE orders SET status = 'cancelled', note = ? WHERE id = ?").run(reason, s.id);
-  if (sibs.length) notify(db, o.user_id, 'order', `OCO: the other leg of order #${o.id} (${o.symbol}) was cancelled. ${reason}`);
+  const sibs = await db.prepare(`SELECT id FROM orders WHERE oco_group = ? AND id != ? AND ${WORKING}`).all(o.oco_group, o.id);
+  for (const s of sibs) await db.prepare("UPDATE orders SET status = 'cancelled', note = ? WHERE id = ?").run(reason, s.id);
+  if (sibs.length) await notify(db, o.user_id, 'order', `OCO: the other leg of order #${o.id} (${o.symbol}) was cancelled. ${reason}`);
 }
 
 // Executes one slice of an order at `price`. Throws (and the caller rolls back) on insufficient funds or shares.
-function fillSlice(db, o, price, now, qty, patch, { fee = 0, mid = null, slippage = 0 } = {}) {
+async function fillSlice(db, o, price, now, qty, patch, { fee = 0, mid = null, slippage = 0 } = {}) {
   const uid = o.user_id;
   const cost = r2(price * qty);
   const charge = o.side === 'buy' ? fee : Math.min(fee, cost); // a sale never costs more in fees than it brings in
   const total = r2(o.side === 'buy' ? cost + charge : cost - charge);
   if (o.side === 'buy') {
-    const { balance } = db.prepare('SELECT balance FROM users WHERE id = ?').get(uid);
+    const { balance } = await db.prepare('SELECT balance FROM users WHERE id = ?').get(uid);
     if (balance < total) throw new Error('Insufficient funds');
-    if (lossState(db, uid, now).reached) throw new Error('Daily demo-loss limit reached');
-    db.prepare('UPDATE users SET balance = balance - ? WHERE id = ?').run(total, uid);
-    const h = db.prepare('SELECT * FROM holdings WHERE user_id = ? AND symbol = ?').get(uid, o.symbol);
+    if ((await lossState(db, uid, now)).reached) throw new Error('Daily demo-loss limit reached');
+    await db.prepare('UPDATE users SET balance = balance - ? WHERE id = ?').run(total, uid);
+    const h = await db.prepare('SELECT * FROM holdings WHERE user_id = ? AND symbol = ?').get(uid, o.symbol);
     if (h) {
       const q = h.quantity + qty;
-      db.prepare('UPDATE holdings SET quantity = ?, avg_cost = ? WHERE user_id = ? AND symbol = ?')
+      await db.prepare('UPDATE holdings SET quantity = ?, avg_cost = ? WHERE user_id = ? AND symbol = ?')
         .run(q, (h.avg_cost * h.quantity + price * qty + charge) / q, uid, o.symbol); // the fee counts towards the cost basis
     } else {
-      db.prepare('INSERT INTO holdings VALUES (?, ?, ?, ?)').run(uid, o.symbol, qty, charge ? (price * qty + charge) / qty : price);
+      await db.prepare('INSERT INTO holdings VALUES (?, ?, ?, ?)').run(uid, o.symbol, qty, charge ? (price * qty + charge) / qty : price);
     }
   } else {
-    const h = db.prepare('SELECT * FROM holdings WHERE user_id = ? AND symbol = ?').get(uid, o.symbol);
+    const h = await db.prepare('SELECT * FROM holdings WHERE user_id = ? AND symbol = ?').get(uid, o.symbol);
     if (!h || h.quantity < qty - EPS) throw new Error('Insufficient holdings');
     const left = h.quantity - qty;
-    if (left < EPS) db.prepare('DELETE FROM holdings WHERE user_id = ? AND symbol = ?').run(uid, o.symbol);
-    else db.prepare('UPDATE holdings SET quantity = ? WHERE user_id = ? AND symbol = ?').run(left, uid, o.symbol);
-    db.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').run(total, uid);
+    if (left < EPS) await db.prepare('DELETE FROM holdings WHERE user_id = ? AND symbol = ?').run(uid, o.symbol);
+    else await db.prepare('UPDATE holdings SET quantity = ? WHERE user_id = ? AND symbol = ?').run(left, uid, o.symbol);
+    await db.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').run(total, uid);
   }
   const at = sqlTime(now);
-  const fillId = db.prepare('INSERT INTO fills (order_id, user_id, symbol, side, quantity, price, filled_at, fee, mid, slippage_bps) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(o.id, uid, o.symbol, o.side, qty, price, at, charge, mid, slippage).lastInsertRowid;
-  db.prepare('INSERT INTO transactions (user_id, type, symbol, amount, note, order_id, fill_id) VALUES (?, ?, ?, ?, ?, ?, ?)')
+  const fillId = (await db.prepare('INSERT INTO fills (order_id, user_id, symbol, side, quantity, price, filled_at, fee, mid, slippage_bps) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(o.id, uid, o.symbol, o.side, qty, price, at, charge, mid, slippage)).lastInsertRowid;
+  await db.prepare('INSERT INTO transactions (user_id, type, symbol, amount, note, order_id, fill_id) VALUES (?, ?, ?, ?, ?, ?, ?)')
     .run(uid, o.side, o.symbol, o.side === 'buy' ? -total : total, `${qty} ${o.symbol} @ ${price}${charge ? `, fee ${charge}` : ''}`, o.id, fillId);
 
   const filled = o.filled_quantity + qty;
   const done = o.quantity - filled < EPS;
   const avg = ((o.fill_price ?? 0) * o.filled_quantity + price * qty) / filled;
-  persist(db, o.id, {
+  await persist(db, o.id, {
     ...patch, filled_quantity: done ? o.quantity : filled, fill_price: r6(avg), filled_at: at,
     status: done ? 'filled' : 'partially_filled', last_slot: liquiditySlot(now),
   });
-  if (done) notify(db, uid, 'order', `Your ${LABELS[o.type].toLowerCase()} ${o.side} order for ${o.quantity} ${o.symbol} filled at an average ${r6(avg)}.`);
-  else if (o.filled_quantity === 0) notify(db, uid, 'order', `Your ${LABELS[o.type].toLowerCase()} ${o.side} order for ${o.quantity} ${o.symbol} is partially filled (${r6(filled)} so far); the rest fills as liquidity allows.`);
-  if (o.filled_quantity === 0) cancelSiblings(db, o, 'The other leg filled.');
+  if (done) await notify(db, uid, 'order', `Your ${LABELS[o.type].toLowerCase()} ${o.side} order for ${o.quantity} ${o.symbol} filled at an average ${r6(avg)}.`);
+  else if (o.filled_quantity === 0) await notify(db, uid, 'order', `Your ${LABELS[o.type].toLowerCase()} ${o.side} order for ${o.quantity} ${o.symbol} is partially filled (${r6(filled)} so far); the rest fills as liquidity allows.`);
+  if (o.filled_quantity === 0) await cancelSiblings(db, o, 'The other leg filled.');
 }
 
-function reject(db, o, reason) {
-  atomic(db, () => {
-    db.prepare("UPDATE orders SET status = 'rejected', note = ? WHERE id = ?").run(reason, o.id);
-    cancelSiblings(db, o, `This leg was rejected: ${reason}.`);
+async function reject(db, o, reason) {
+  await atomic(db, async () => {
+    await db.prepare("UPDATE orders SET status = 'rejected', note = ? WHERE id = ?").run(reason, o.id);
+    await cancelSiblings(db, o, `This leg was rejected: ${reason}.`);
   });
-  notify(db, o.user_id, 'order', `Order #${o.id} (${o.symbol}) rejected: ${reason}.`);
+  await notify(db, o.user_id, 'order', `Order #${o.id} (${o.symbol}) rejected: ${reason}.`);
 }
 
-export function processOrder(db, id, now = Date.now()) {
-  const o = db.prepare(`SELECT * FROM orders WHERE id = ? AND ${WORKING}`).get(id);
+export async function processOrder(db, id, now = Date.now()) {
+  const o = await db.prepare(`SELECT * FROM orders WHERE id = ? AND ${WORKING}`).get(id);
   if (!o) return;
   const asset = getAsset(o.symbol);
   // Orders wait, untouched, while the account is suspended or the asset is paused or disabled.
-  if ((asset.status ?? 'active') !== 'active' || db.prepare('SELECT suspended_at FROM users WHERE id = ?').get(o.user_id)?.suspended_at) return;
+  if ((asset.status ?? 'active') !== 'active' || (await db.prepare('SELECT suspended_at FROM users WHERE id = ?').get(o.user_id))?.suspended_at) return;
   if (o.execute_after !== null && now < o.execute_after) return; // still on its way to the market
   if (getSimulation().marketHours && !isOpen(asset.session, now)) return; // queued until the market opens
 
@@ -437,7 +424,7 @@ export function processOrder(db, id, now = Date.now()) {
   const quoted = buy ? ask : bid; // triggers and fills are judged on the side of the book this order trades against
   const { ready, patch } = evaluate(o, quoted);
   const slot = liquiditySlot(now);
-  if (!ready || o.last_slot === slot) { persist(db, o.id, patch); return; }
+  if (!ready || o.last_slot === slot) { await persist(db, o.id, patch); return; }
 
   const liquidity = liquidityAt(asset, slot);
   const qty = Math.min(remaining(o), floorToStep(liquidity, quantityRules(asset).step));
@@ -448,35 +435,35 @@ export function processOrder(db, id, now = Date.now()) {
   if (limit !== null) price = buy ? Math.min(price, limit) : Math.max(price, limit);
   const fee = feeFor(asset, r2(price * qty));
   try {
-    atomic(db, () => fillSlice(db, o, price, now, qty, patch, { fee, mid, slippage: slip }));
-    evaluateAchievements(db, o.user_id, now);
+    await atomic(db, async () => await fillSlice(db, o, price, now, qty, patch, { fee, mid, slippage: slip }));
+    await evaluateAchievements(db, o.user_id, now);
   } catch (e) {
-    reject(db, o, e.message);
+    await reject(db, o, e.message);
   }
 }
 
-export function expireOrders(db, now = Date.now()) {
-  const due = db.prepare(`SELECT * FROM orders WHERE ${WORKING} AND expires_at IS NOT NULL AND expires_at <= ?`).all(now);
+export async function expireOrders(db, now = Date.now()) {
+  const due = await db.prepare(`SELECT * FROM orders WHERE ${WORKING} AND expires_at IS NOT NULL AND expires_at <= ?`).all(now);
   for (const o of due) {
-    db.prepare("UPDATE orders SET status = 'expired', note = 'Day order expired' WHERE id = ?").run(o.id);
-    notify(db, o.user_id, 'order', `Your day order #${o.id} for ${o.quantity} ${o.symbol} expired with ${r6(o.filled_quantity)} filled.`);
+    await db.prepare("UPDATE orders SET status = 'expired', note = 'Day order expired' WHERE id = ?").run(o.id);
+    await notify(db, o.user_id, 'order', `Your day order #${o.id} for ${o.quantity} ${o.symbol} expired with ${r6(o.filled_quantity)} filled.`);
   }
 }
 
-export function matchPending(db, now = Date.now()) {
-  expireOrders(db, now);
-  checkAlerts(db);
-  for (const { id } of db.prepare(`SELECT id FROM orders WHERE ${WORKING} ORDER BY id`).all()) processOrder(db, id, now);
+export async function matchPending(db, now = Date.now()) {
+  await expireOrders(db, now);
+  await checkAlerts(db);
+  for (const { id } of await db.prepare(`SELECT id FROM orders WHERE ${WORKING} ORDER BY id`).all()) await processOrder(db, id, now);
 }
 
 // Trigger active alerts whose target has been crossed; each fires once.
-export function checkAlerts(db) {
-  const active = db.prepare("SELECT * FROM price_alerts WHERE status = 'active'").all();
+export async function checkAlerts(db) {
+  const active = await db.prepare("SELECT * FROM price_alerts WHERE status = 'active'").all();
   for (const a of active) {
     const p = priceAt(getAsset(a.symbol));
     if (a.direction === 'above' ? p < a.target : p > a.target) continue;
-    db.prepare("UPDATE price_alerts SET status = 'triggered', triggered_at = CURRENT_TIMESTAMP WHERE id = ?").run(a.id);
-    notify(db, a.user_id, 'price', `${a.symbol} is now ${p}, ${a.direction} your alert at ${a.target}.`);
+    await db.prepare("UPDATE price_alerts SET status = 'triggered', triggered_at = CURRENT_TIMESTAMP WHERE id = ?").run(a.id);
+    await notify(db, a.user_id, 'price', `${a.symbol} is now ${p}, ${a.direction} your alert at ${a.target}.`);
   }
 }
 
@@ -535,10 +522,10 @@ export function explainOrder(o, price, now = Date.now()) {
 }
 
 // Everything the order detail screen shows: the order, each fill, the totals, linked OCO legs and live state.
-export function getOrderDetail(db, userId, id, now = Date.now()) {
-  const order = db.prepare('SELECT * FROM orders WHERE id = ? AND user_id = ?').get(id, userId);
+export async function getOrderDetail(db, userId, id, now = Date.now()) {
+  const order = await db.prepare('SELECT * FROM orders WHERE id = ? AND user_id = ?').get(id, userId);
   if (!order) return null;
-  const rows = db.prepare('SELECT * FROM fills WHERE order_id = ? ORDER BY filled_at, id').all(order.id);
+  const rows = await db.prepare('SELECT * FROM fills WHERE order_id = ? ORDER BY filled_at, id').all(order.id);
   const fills = rows.map((f) => ({
     id: f.id, quantity: f.quantity, price: f.price, amount: r2(f.quantity * f.price), fee: f.fee, mid: f.mid, slippageBps: f.slippage_bps,
     filledAt: new Date(`${f.filled_at.replace(' ', 'T')}Z`).toISOString(),
@@ -549,7 +536,7 @@ export function getOrderDetail(db, userId, id, now = Date.now()) {
   const price = priceAt(getAsset(order.symbol), now);
   const asset = getAsset(order.symbol);
   const left = remaining(order);
-  const linked = order.oco_group === null ? [] : db.prepare(
+  const linked = order.oco_group === null ? [] : await db.prepare(
     'SELECT id, type, side, status, price, limit_price, note FROM orders WHERE oco_group = ? AND id != ? ORDER BY id',
   ).all(order.oco_group, order.id);
   return {

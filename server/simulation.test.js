@@ -23,16 +23,16 @@ const r6 = (n) => Math.round(n * 1e6) / 1e6;
 const asset = (symbol) => getAsset(symbol);
 
 // A fresh database with one funded user, under the given profile.
-function world(profile = 'realistic', balance = 1e7) {
+async function world(profile = 'realistic', balance = 1e7) {
   configureSimulation(profile);
-  const db = openDb(':memory:');
-  db.prepare("INSERT INTO users (name, email, password_hash, balance) VALUES ('T', 't@x.com', 'x', ?)").run(balance);
-  loadAssetState(db);
-  const user = db.prepare('SELECT * FROM users').get();
-  const place = (spec, now) => placeOrder(db, user, spec, now, { confirmLarge: true });
-  const fills = (orderId) => db.prepare('SELECT * FROM fills WHERE order_id = ? ORDER BY id').all(orderId);
-  const order = (id) => db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
-  const balanceNow = () => db.prepare('SELECT balance FROM users WHERE id = ?').get(user.id).balance;
+  const db = await openDb(':memory:');
+  await db.prepare("INSERT INTO users (name, email, password_hash, balance) VALUES ('T', 't@x.com', 'x', ?)").run(balance);
+  await loadAssetState(db);
+  const user = await db.prepare('SELECT * FROM users').get();
+  const place = async (spec, now) => await placeOrder(db, user, spec, now, { confirmLarge: true });
+  const fills = async (orderId) => await db.prepare('SELECT * FROM fills WHERE order_id = ? ORDER BY id').all(orderId);
+  const order = async (id) => await db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
+  const balanceNow = async () => (await db.prepare('SELECT balance FROM users WHERE id = ?').get(user.id)).balance;
   return { db, user, place, fills, order, balanceNow };
 }
 
@@ -57,38 +57,38 @@ test('determinism: the same inputs always give the same numbers, and a different
   assert.equal(latencyMs(eth, 5, REALISTIC), latencyMs(eth, 5, REALISTIC));
 });
 
-test('determinism: the same orders at the same times give identical fills in two separate databases', () => {
-  const run = () => {
-    const w = world();
-    const placed = w.place({ symbol: 'SOL', side: 'buy', type: 'market', quantity: 130 }, MON_OPEN).order;
-    for (let i = 1; i <= 8; i++) matchPending(w.db, MON_OPEN + 2 * SEC + i * 5 * SEC);
-    const sold = w.place({ symbol: 'SOL', side: 'sell', type: 'market', quantity: 20 }, MON_OPEN + HOUR).order;
-    matchPending(w.db, MON_OPEN + HOUR + 3 * SEC);
+test('determinism: the same orders at the same times give identical fills in two separate databases', async () => {
+  const run = async () => {
+    const w = await world();
+    const placed = (await w.place({ symbol: 'SOL', side: 'buy', type: 'market', quantity: 130 }, MON_OPEN)).order;
+    for (let i = 1; i <= 8; i++) await matchPending(w.db, MON_OPEN + 2 * SEC + i * 5 * SEC);
+    const sold = (await w.place({ symbol: 'SOL', side: 'sell', type: 'market', quantity: 20 }, MON_OPEN + HOUR)).order;
+    await matchPending(w.db, MON_OPEN + HOUR + 3 * SEC);
     return {
-      buys: w.fills(placed.id).map(({ quantity, price, fee, mid, slippage_bps, filled_at }) => [quantity, price, fee, mid, slippage_bps, filled_at]),
-      sells: w.fills(sold.id).map(({ quantity, price, fee }) => [quantity, price, fee]),
-      balance: w.balanceNow(), execAfter: w.order(placed.id).execute_after,
+      buys: (await w.fills(placed.id)).map(({ quantity, price, fee, mid, slippage_bps, filled_at }) => [quantity, price, fee, mid, slippage_bps, filled_at]),
+      sells: (await w.fills(sold.id)).map(({ quantity, price, fee }) => [quantity, price, fee]),
+      balance: await w.balanceNow(), execAfter: (await w.order(placed.id)).execute_after,
     };
   };
-  const a = run();
+  const a = await run();
   assert.ok(a.buys.length >= 3, 'a large order fills in several parts');
-  assert.deepEqual(run(), a);
+  assert.deepEqual(await run(), a);
 });
 
 // ------------------------------------------------------------------ profiles
 
-test('the ideal profile is the old behaviour: no spread, fee, slippage, delay or gaps, and instant fills', () => {
-  const w = world('ideal');
+test('the ideal profile is the old behaviour: no spread, fee, slippage, delay or gaps, and instant fills', async () => {
+  const w = await world('ideal');
   for (const a of ASSETS) {
     const p = paramsFor(a, IDEAL);
     assert.equal(p.spreadBps + p.feeBps + p.impactBps + p.jitterBps + p.latencyMs[1], 0, a.symbol);
   }
   const mid = priceAt(asset('ETH'), MON_OPEN);
   assert.deepEqual(bidAsk(asset('ETH'), mid, IDEAL), { bid: mid, ask: mid, spreadBps: 0 });
-  const o = w.place({ symbol: 'ETH', side: 'buy', type: 'market', quantity: 1 }, MON_OPEN).order;
+  const o = (await w.place({ symbol: 'ETH', side: 'buy', type: 'market', quantity: 1 }, MON_OPEN)).order;
   assert.equal(o.status, 'filled');
   assert.equal(o.execute_after, null);
-  const [f] = w.fills(o.id);
+  const [f] = await w.fills(o.id);
   assert.equal(f.price, mid);
   assert.equal(f.fee, 0);
   assert.equal(f.slippage_bps, 0);
@@ -125,15 +125,15 @@ test('spread depends on the market and on risk: forex is tight, crypto wider, an
 
 test('spread is configurable per asset: an override replaces the default, and clearing it restores the default', async () => {
   configureSimulation('realistic');
-  const db = openDb(':memory:');
+  const db = await openDb(':memory:');
   const clock = { t: MON_OPEN };
-  db.prepare("INSERT INTO users (name, email, password_hash, role) VALUES ('Ada', 'ada@x.com', 'x', 'admin')").run();
+  await db.prepare("INSERT INTO users (name, email, password_hash, role) VALUES ('Ada', 'ada@x.com', 'x', 'admin')").run();
   const server = createApp(db, { secret: 's', now: () => clock.t, simulation: 'realistic' }).listen(0);
   try {
     const base = `http://localhost:${server.address().port}/api`;
     const reg = await fetch(`${base}/auth/register`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: 'Root', email: 'root@x.com', password: 'password1' }) });
     const { token, user } = await reg.json();
-    db.prepare("UPDATE users SET role = 'admin' WHERE id = ?").run(user.id);
+    await db.prepare("UPDATE users SET role = 'admin' WHERE id = ?").run(user.id);
     const call = async (method, path, body) => {
       const r = await fetch(base + path, { method, headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` }, body: body && JSON.stringify(body) });
       return { status: r.status, body: await r.json() };
@@ -147,10 +147,10 @@ test('spread is configurable per asset: an override replaces the default, and cl
     const live = (await call('GET', '/markets/AAPL')).body.asset;
     assert.equal(live.spreadBps, 25);
     assert.ok(Math.abs(((live.ask - live.bid) / live.price) * 1e4 - 25) < 0.05);
-    assert.equal(db.prepare("SELECT spread_bps FROM asset_state WHERE symbol = 'AAPL'").get().spread_bps, 25, 'stored');
+    assert.equal((await db.prepare("SELECT spread_bps FROM asset_state WHERE symbol = 'AAPL'").get()).spread_bps, 25, 'stored');
 
     delete asset('AAPL').spreadBps; // as if the process restarted
-    loadAssetState(db);
+    await loadAssetState(db);
     assert.equal(paramsFor(asset('AAPL')).spreadBps, 25, 'survives a restart');
 
     assert.equal((await call('PATCH', '/admin/assets/AAPL', { spreadBps: -1 })).status, 400);
@@ -176,38 +176,38 @@ test('fees: a percentage with a minimum, none for forex, and recorded on every f
   assert.equal(feeFor(asset('BTC'), 1000, IDEAL), 0);
 });
 
-test('a buy costs the price plus the fee, and the fee becomes part of the cost basis', () => {
-  const w = world();
-  const o = w.place({ symbol: 'AAPL', side: 'buy', type: 'market', quantity: 10 }, MON_OPEN).order;
+test('a buy costs the price plus the fee, and the fee becomes part of the cost basis', async () => {
+  const w = await world();
+  const o = (await w.place({ symbol: 'AAPL', side: 'buy', type: 'market', quantity: 10 }, MON_OPEN)).order;
   assert.equal(o.status, 'pending', 'it takes a moment to reach the market');
-  matchPending(w.db, MON_OPEN + 3 * SEC);
-  const [f] = w.fills(o.id);
+  await matchPending(w.db, MON_OPEN + 3 * SEC);
+  const [f] = await w.fills(o.id);
   assert.equal(f.quantity, 10);
   const cost = Math.round(f.price * 10 * 100) / 100;
   assert.equal(f.fee, Math.max(0.01, Math.round(cost * 3 / 1e4 * 100) / 100));
-  assert.equal(Math.round((1e7 - w.balanceNow()) * 100) / 100, Math.round((cost + f.fee) * 100) / 100, 'balance fell by cost plus fee');
-  const h = w.db.prepare("SELECT * FROM holdings WHERE symbol = 'AAPL'").get();
+  assert.equal(Math.round((1e7 - await w.balanceNow()) * 100) / 100, Math.round((cost + f.fee) * 100) / 100, 'balance fell by cost plus fee');
+  const h = await w.db.prepare("SELECT * FROM holdings WHERE symbol = 'AAPL'").get();
   assert.ok(Math.abs(h.avg_cost - (f.price * 10 + f.fee) / 10) < 1e-9, 'cost basis includes the fee');
-  const tx = w.db.prepare('SELECT * FROM transactions WHERE order_id = ?').get(o.id);
+  const tx = await w.db.prepare('SELECT * FROM transactions WHERE order_id = ?').get(o.id);
   assert.equal(tx.amount, -Math.round((cost + f.fee) * 100) / 100);
   assert.match(tx.note, /, fee \d/);
 });
 
-test('a sell receives the price minus the fee, and realised profit counts the fees on both sides', () => {
-  const w = world();
-  const buy = w.place({ symbol: 'XAU', side: 'buy', type: 'market', quantity: 2 }, MON_OPEN).order;
-  matchPending(w.db, MON_OPEN + 3 * SEC);
-  const sell = w.place({ symbol: 'XAU', side: 'sell', type: 'market', quantity: 2 }, MON_OPEN + HOUR).order;
-  matchPending(w.db, MON_OPEN + HOUR + 3 * SEC);
-  const [b] = w.fills(buy.id);
-  const [s] = w.fills(sell.id);
+test('a sell receives the price minus the fee, and realised profit counts the fees on both sides', async () => {
+  const w = await world();
+  const buy = (await w.place({ symbol: 'XAU', side: 'buy', type: 'market', quantity: 2 }, MON_OPEN)).order;
+  await matchPending(w.db, MON_OPEN + 3 * SEC);
+  const sell = (await w.place({ symbol: 'XAU', side: 'sell', type: 'market', quantity: 2 }, MON_OPEN + HOUR)).order;
+  await matchPending(w.db, MON_OPEN + HOUR + 3 * SEC);
+  const [b] = await w.fills(buy.id);
+  const [s] = await w.fills(sell.id);
   assert.ok(b.fee > 0 && s.fee > 0);
   const proceeds = Math.round(s.price * 2 * 100) / 100 - s.fee;
   const spent = Math.round(b.price * 2 * 100) / 100 + b.fee;
-  assert.ok(Math.abs(w.balanceNow() - (1e7 - spent + proceeds)) < 0.011);
-  const { realized } = replayFills(w.db.prepare('SELECT id, symbol, side, quantity, price, fee FROM fills ORDER BY id').all());
+  assert.ok(Math.abs(await w.balanceNow() - (1e7 - spent + proceeds)) < 0.011);
+  const { realized } = replayFills(await w.db.prepare('SELECT id, symbol, side, quantity, price, fee FROM fills ORDER BY id').all());
   assert.ok(Math.abs(realized - ((s.price - (b.price * 2 + b.fee) / 2) * 2 - s.fee)) < 1e-9);
-  assert.equal(w.db.prepare("SELECT COUNT(*) n FROM holdings WHERE symbol = 'XAU'").get().n, 0);
+  assert.equal((await w.db.prepare("SELECT COUNT(*) n FROM holdings WHERE symbol = 'XAU'").get()).n, 0);
 });
 
 // ------------------------------------------------------------------ slippage
@@ -226,77 +226,77 @@ test('slippage: against the trader, bigger for bigger slices, bounded, and repea
   assert.equal(slippageBps(eth, { ...args(2) }, IDEAL), 0);
 });
 
-test('a market buy fills above the ask and a market sell below the bid, never by more than the worst case', () => {
-  const w = world();
+test('a market buy fills above the ask and a market sell below the bid, never by more than the worst case', async () => {
+  const w = await world();
   const eth = asset('ETH');
-  const buy = w.place({ symbol: 'ETH', side: 'buy', type: 'market', quantity: 3 }, MON_OPEN).order;
+  const buy = (await w.place({ symbol: 'ETH', side: 'buy', type: 'market', quantity: 3 }, MON_OPEN)).order;
   const t1 = MON_OPEN + 5 * SEC;
-  matchPending(w.db, t1);
-  const [b] = w.fills(buy.id);
+  await matchPending(w.db, t1);
+  const [b] = await w.fills(buy.id);
   const book = bidAsk(eth, priceAt(eth, t1));
   assert.equal(b.mid, priceAt(eth, t1), 'the mid price at the moment of the fill is recorded');
   assert.equal(b.price, r6(book.ask * (1 + b.slippage_bps / 1e4)));
   assert.ok(b.price >= book.ask && b.price <= book.ask * (1 + maxSlippageBps(eth) / 1e4) + 1e-6);
 
-  const sell = w.place({ symbol: 'ETH', side: 'sell', type: 'market', quantity: 3 }, MON_OPEN + HOUR).order;
+  const sell = (await w.place({ symbol: 'ETH', side: 'sell', type: 'market', quantity: 3 }, MON_OPEN + HOUR)).order;
   const t2 = MON_OPEN + HOUR + 5 * SEC;
-  matchPending(w.db, t2);
-  const [s] = w.fills(sell.id);
+  await matchPending(w.db, t2);
+  const [s] = await w.fills(sell.id);
   const book2 = bidAsk(eth, priceAt(eth, t2));
   assert.equal(s.price, r6(book2.bid * (1 - s.slippage_bps / 1e4)));
   assert.ok(s.price <= book2.bid);
 });
 
-test('limit orders never slip and never fill beyond their limit price', () => {
-  const w = world();
+test('limit orders never slip and never fill beyond their limit price', async () => {
+  const w = await world();
   const eth = asset('ETH');
   const t = MON_OPEN + 10 * SEC;
   const ask = bidAsk(eth, priceAt(eth, t)).ask;
   const limit = r6(ask * 1.01);
-  const o = w.place({ symbol: 'ETH', side: 'buy', type: 'limit', quantity: 1, price: limit }, t - 10 * SEC).order;
-  matchPending(w.db, t);
-  const [f] = w.fills(o.id);
+  const o = (await w.place({ symbol: 'ETH', side: 'buy', type: 'limit', quantity: 1, price: limit }, t - 10 * SEC)).order;
+  await matchPending(w.db, t);
+  const [f] = await w.fills(o.id);
   assert.equal(f.slippage_bps, 0);
   assert.equal(f.price, ask, 'filled at the ask, which is better than the limit');
   assert.ok(f.price <= limit);
   // A limit sitting just above the ask is still not beaten by the spread.
-  const tight = w.place({ symbol: 'ETH', side: 'buy', type: 'limit', quantity: 1, price: bidAsk(eth, priceAt(eth, t + 20 * SEC)).ask }, t + 10 * SEC).order;
-  matchPending(w.db, t + 20 * SEC);
-  assert.ok(w.fills(tight.id)[0].price <= w.order(tight.id).price);
+  const tight = (await w.place({ symbol: 'ETH', side: 'buy', type: 'limit', quantity: 1, price: bidAsk(eth, priceAt(eth, t + 20 * SEC)).ask }, t + 10 * SEC)).order;
+  await matchPending(w.db, t + 20 * SEC);
+  assert.ok((await w.fills(tight.id))[0].price <= (await w.order(tight.id)).price);
 });
 
-test('a buy limit between the bid and the ask does not fill: the spread is real', () => {
-  const w = world();
+test('a buy limit between the bid and the ask does not fill: the spread is real', async () => {
+  const w = await world();
   const eth = asset('ETH');
   const t = MON_OPEN + 10 * SEC;
   const { bid, ask } = bidAsk(eth, priceAt(eth, t));
-  const o = w.place({ symbol: 'ETH', side: 'buy', type: 'limit', quantity: 1, price: r6((bid + ask) / 2) }, t - 10 * SEC).order;
-  matchPending(w.db, t);
-  assert.equal(w.order(o.id).status, 'pending', 'the mid price is not available to a buyer');
-  assert.equal(w.fills(o.id).length, 0);
+  const o = (await w.place({ symbol: 'ETH', side: 'buy', type: 'limit', quantity: 1, price: r6((bid + ask) / 2) }, t - 10 * SEC)).order;
+  await matchPending(w.db, t);
+  assert.equal((await w.order(o.id)).status, 'pending', 'the mid price is not available to a buyer');
+  assert.equal((await w.fills(o.id)).length, 0);
 });
 
-test('a sell stop triggers on the bid, not the mid price', () => {
-  const w = world();
+test('a sell stop triggers on the bid, not the mid price', async () => {
+  const w = await world();
   const eth = asset('ETH');
   const t = MON_OPEN + 10 * SEC;
-  w.place({ symbol: 'ETH', side: 'buy', type: 'market', quantity: 2 }, MON_OPEN);
-  matchPending(w.db, MON_OPEN + 3 * SEC);
-  const o = w.place({ symbol: 'ETH', side: 'sell', type: 'stop_loss', quantity: 2, price: priceAt(eth, MON_OPEN) * 0.5 }, MON_OPEN + 4 * SEC).order;
+  await w.place({ symbol: 'ETH', side: 'buy', type: 'market', quantity: 2 }, MON_OPEN);
+  await matchPending(w.db, MON_OPEN + 3 * SEC);
+  const o = (await w.place({ symbol: 'ETH', side: 'sell', type: 'stop_loss', quantity: 2, price: priceAt(eth, MON_OPEN) * 0.5 }, MON_OPEN + 4 * SEC)).order;
   const { bid } = bidAsk(eth, priceAt(eth, t));
   const mid = priceAt(eth, t);
   // Put the stop between the bid and the mid: only the bid has reached it.
-  w.db.prepare('UPDATE orders SET price = ? WHERE id = ?').run(r6((bid + mid) / 2), o.id);
-  matchPending(w.db, t);
-  assert.equal(w.order(o.id).status, 'filled');
-  const lower = w.place({ symbol: 'ETH', side: 'buy', type: 'market', quantity: 1 }, t + SEC).order;
-  matchPending(w.db, t + 10 * SEC);
-  const o2 = w.place({ symbol: 'ETH', side: 'sell', type: 'stop_loss', quantity: 1, price: priceAt(eth, t) * 0.5 }, t + 11 * SEC).order;
+  await w.db.prepare('UPDATE orders SET price = ? WHERE id = ?').run(r6((bid + mid) / 2), o.id);
+  await matchPending(w.db, t);
+  assert.equal((await w.order(o.id)).status, 'filled');
+  const lower = (await w.place({ symbol: 'ETH', side: 'buy', type: 'market', quantity: 1 }, t + SEC)).order;
+  await matchPending(w.db, t + 10 * SEC);
+  const o2 = (await w.place({ symbol: 'ETH', side: 'sell', type: 'stop_loss', quantity: 1, price: priceAt(eth, t) * 0.5 }, t + 11 * SEC)).order;
   const t3 = t + 30 * SEC;
   const book3 = bidAsk(eth, priceAt(eth, t3));
-  w.db.prepare('UPDATE orders SET price = ? WHERE id = ?').run(r6(book3.bid - 0.01), o2.id);
-  matchPending(w.db, t3);
-  assert.equal(w.order(o2.id).status, 'pending', 'the bid is still above the stop');
+  await w.db.prepare('UPDATE orders SET price = ? WHERE id = ?').run(r6(book3.bid - 0.01), o2.id);
+  await matchPending(w.db, t3);
+  assert.equal((await w.order(o2.id)).status, 'pending', 'the bid is still above the stop');
   assert.ok(lower);
 });
 
@@ -314,25 +314,25 @@ test('liquidity swings repeatably around the asset liquidity', () => {
   assert.equal(floorToStep(3.3, 0), 3.3);
 });
 
-test('a large order fills in parts, each within that moment\'s liquidity, and adds up exactly', () => {
-  const w = world();
+test('a large order fills in parts, each within that moment\'s liquidity, and adds up exactly', async () => {
+  const w = await world();
   const sol = asset('SOL');
-  const o = w.place({ symbol: 'SOL', side: 'buy', type: 'market', quantity: 130 }, MON_OPEN).order;
-  assert.ok(previewOrder(w.db, w.user, { symbol: 'SOL', side: 'buy', type: 'market', quantity: 130 }, MON_OPEN).warnings.some((x) => x.code === 'PARTIAL_FILL'));
+  const o = (await w.place({ symbol: 'SOL', side: 'buy', type: 'market', quantity: 130 }, MON_OPEN)).order;
+  assert.ok((await previewOrder(w.db, w.user, { symbol: 'SOL', side: 'buy', type: 'market', quantity: 130 }, MON_OPEN)).warnings.some((x) => x.code === 'PARTIAL_FILL'));
   const slots = [];
-  for (let i = 1; i <= 12 && w.order(o.id).status !== 'filled'; i++) {
+  for (let i = 1; i <= 12 && (await w.order(o.id)).status !== 'filled'; i++) {
     const at = MON_OPEN + 2 * SEC + i * 5 * SEC;
-    matchPending(w.db, at);
+    await matchPending(w.db, at);
     slots.push(liquiditySlot(at));
   }
-  const parts = w.fills(o.id);
+  const parts = await w.fills(o.id);
   assert.ok(parts.length >= 3, `${parts.length} parts`);
-  assert.equal(w.order(o.id).status, 'filled');
+  assert.equal((await w.order(o.id)).status, 'filled');
   assert.ok(Math.abs(parts.reduce((s, f) => s + f.quantity, 0) - 130) < 1e-9);
   parts.forEach((f, i) => assert.ok(f.quantity <= liquidityAt(sol, slots[i]) + 1e-9, `part ${i} within liquidity`));
   assert.ok(new Set(parts.map((f) => f.quantity)).size > 1, 'the parts differ in size');
-  assert.equal(w.order(o.id).status, 'filled');
-  const detail = getOrderDetail(w.db, w.user.id, o.id, MON_OPEN + HOUR);
+  assert.equal((await w.order(o.id)).status, 'filled');
+  const detail = await getOrderDetail(w.db, w.user.id, o.id, MON_OPEN + HOUR);
   assert.equal(detail.fills.length, parts.length);
   assert.ok(detail.summary.totalFees > 0);
   assert.match(detail.summary.notice, /Paper trading is a simulation/);
@@ -341,25 +341,25 @@ test('a large order fills in parts, each within that moment\'s liquidity, and ad
 
 // ------------------------------------------------------------------ execution delay
 
-test('execution delay: an order waits its simulated latency, then executes at the price of that moment', () => {
-  const w = world();
+test('execution delay: an order waits its simulated latency, then executes at the price of that moment', async () => {
+  const w = await world();
   const eth = asset('ETH');
-  const o = w.place({ symbol: 'ETH', side: 'buy', type: 'market', quantity: 1 }, MON_OPEN).order;
+  const o = (await w.place({ symbol: 'ETH', side: 'buy', type: 'market', quantity: 1 }, MON_OPEN)).order;
   const delay = latencyMs(eth, o.id);
   assert.ok(delay >= 300 && delay <= 1200, `${delay}ms is within the crypto range`);
   assert.equal(o.execute_after, MON_OPEN + delay);
-  matchPending(w.db, MON_OPEN + delay - 1);
-  assert.equal(w.order(o.id).status, 'pending', 'not there yet');
-  assert.match(getOrderDetail(w.db, w.user.id, o.id, MON_OPEN + 1).explanation, /still on its way/);
-  assert.ok(getOrderDetail(w.db, w.user.id, o.id, MON_OPEN + 1).live.executesAt);
+  await matchPending(w.db, MON_OPEN + delay - 1);
+  assert.equal((await w.order(o.id)).status, 'pending', 'not there yet');
+  assert.match((await getOrderDetail(w.db, w.user.id, o.id, MON_OPEN + 1)).explanation, /still on its way/);
+  assert.ok((await getOrderDetail(w.db, w.user.id, o.id, MON_OPEN + 1)).live.executesAt);
   const at = MON_OPEN + delay + 4000;
-  matchPending(w.db, at);
-  const [f] = w.fills(o.id);
+  await matchPending(w.db, at);
+  const [f] = await w.fills(o.id);
   assert.equal(f.mid, priceAt(eth, at), 'priced when it executed, not when it was sent');
-  assert.equal(w.order(o.id).status, 'filled');
+  assert.equal((await w.order(o.id)).status, 'filled');
 });
 
-test('execution delay differs by market, and applies to resting orders too', () => {
+test('execution delay differs by market, and applies to resting orders too', async () => {
   configureSimulation('realistic');
   const ranges = { crypto: [300, 1200], stocks: [500, 1800], forex: [200, 800], commodities: [500, 2000] };
   for (const a of ASSETS) {
@@ -368,45 +368,45 @@ test('execution delay differs by market, and applies to resting orders too', () 
   }
   const delays = Array.from({ length: 60 }, (_, id) => latencyMs(asset('BTC'), id + 1));
   assert.ok(new Set(delays).size > 20);
-  const w = world();
-  const o = w.place({ symbol: 'ETH', side: 'buy', type: 'limit', quantity: 1, price: priceAt(asset('ETH'), MON_OPEN) * 1.2 }, MON_OPEN).order;
+  const w = await world();
+  const o = (await w.place({ symbol: 'ETH', side: 'buy', type: 'limit', quantity: 1, price: priceAt(asset('ETH'), MON_OPEN) * 1.2 }, MON_OPEN)).order;
   assert.ok(o.execute_after > MON_OPEN);
 });
 
 // ------------------------------------------------------------------ market hours and gaps
 
-test('crypto trades at all hours: a Saturday-morning order fills', () => {
-  const w = world();
+test('crypto trades at all hours: a Saturday-morning order fills', async () => {
+  const w = await world();
   assert.equal(sessionState('always', SAT).open, true);
-  const o = w.place({ symbol: 'BTC', side: 'buy', type: 'market', quantity: 0.05 }, SAT).order;
-  matchPending(w.db, SAT + 5 * SEC);
-  assert.equal(w.order(o.id).status, 'filled');
-  assert.equal(previewOrder(w.db, w.user, { symbol: 'BTC', side: 'buy', type: 'market', quantity: 0.05 }, SAT).estimate.marketOpen, true);
+  const o = (await w.place({ symbol: 'BTC', side: 'buy', type: 'market', quantity: 0.05 }, SAT)).order;
+  await matchPending(w.db, SAT + 5 * SEC);
+  assert.equal((await w.order(o.id)).status, 'filled');
+  assert.equal((await previewOrder(w.db, w.user, { symbol: 'BTC', side: 'buy', type: 'market', quantity: 0.05 }, SAT)).estimate.marketOpen, true);
 });
 
-test('stocks: a weekend order is queued with a warning, and fills after the open at the opening price', () => {
-  const w = world();
+test('stocks: a weekend order is queued with a warning, and fills after the open at the opening price', async () => {
+  const w = await world();
   const aapl = asset('AAPL');
-  const warnings = previewOrder(w.db, w.user, { symbol: 'AAPL', side: 'buy', type: 'market', quantity: 10 }, SAT).warnings;
+  const warnings = (await previewOrder(w.db, w.user, { symbol: 'AAPL', side: 'buy', type: 'market', quantity: 10 }, SAT)).warnings;
   assert.ok(warnings.some((x) => x.code === 'MARKET_CLOSED' && /2026-06-08 14:30 UTC/.test(x.message)));
-  const o = w.place({ symbol: 'AAPL', side: 'buy', type: 'market', quantity: 10 }, SAT).order;
+  const o = (await w.place({ symbol: 'AAPL', side: 'buy', type: 'market', quantity: 10 }, SAT)).order;
   assert.equal(o.expires_at, Date.UTC(2026, 5, 9), 'a day order lasts until the end of the day the market opens');
-  matchPending(w.db, SAT + 2 * HOUR);
-  matchPending(w.db, Date.UTC(2026, 5, 7, 12));
-  assert.equal(w.order(o.id).status, 'pending', 'nothing happens while the market is closed');
-  assert.match(getOrderDetail(w.db, w.user.id, o.id, SAT + HOUR).explanation, /market is closed, so this order is queued/);
-  assert.equal(getOrderDetail(w.db, w.user.id, o.id, SAT + HOUR).live.marketOpen, false);
-  matchPending(w.db, Date.UTC(2026, 5, 8, 14, 29));
-  assert.equal(w.order(o.id).status, 'pending', 'one minute before the open');
+  await matchPending(w.db, SAT + 2 * HOUR);
+  await matchPending(w.db, Date.UTC(2026, 5, 7, 12));
+  assert.equal((await w.order(o.id)).status, 'pending', 'nothing happens while the market is closed');
+  assert.match((await getOrderDetail(w.db, w.user.id, o.id, SAT + HOUR)).explanation, /market is closed, so this order is queued/);
+  assert.equal((await getOrderDetail(w.db, w.user.id, o.id, SAT + HOUR)).live.marketOpen, false);
+  await matchPending(w.db, Date.UTC(2026, 5, 8, 14, 29));
+  assert.equal((await w.order(o.id)).status, 'pending', 'one minute before the open');
   const openAt = Date.UTC(2026, 5, 8, 14, 30, 10);
-  matchPending(w.db, openAt);
-  const [f] = w.fills(o.id);
+  await matchPending(w.db, openAt);
+  const [f] = await w.fills(o.id);
   assert.ok(f, 'filled once open');
   assert.equal(f.mid, priceAt(aapl, openAt));
   assert.notEqual(f.mid, priceAt(aapl, SAT), 'at a different price to the weekend one');
 });
 
-test('forex trades from Sunday evening to Friday evening; commodities pause for an hour each day', () => {
+test('forex trades from Sunday evening to Friday evening; commodities pause for an hour each day', async () => {
   configureSimulation('realistic');
   const open = (id, ...d) => sessionState(id, Date.UTC(...d)).open;
   assert.equal(open('forex', 2026, 5, 6, 12), false, 'Saturday');
@@ -420,12 +420,12 @@ test('forex trades from Sunday evening to Friday evening; commodities pause for 
   assert.equal(open('us-equities', 2026, 5, 8, 14, 30), true);
   assert.equal(open('us-equities', 2026, 5, 8, 21, 0), false);
   assert.equal(nextOpen('forex', SAT), Date.UTC(2026, 5, 7, 22, 0));
-  const w = world();
-  const o = w.place({ symbol: 'EURUSD', side: 'buy', type: 'market', quantity: 3000 }, SAT).order;
-  matchPending(w.db, SAT + 12 * HOUR);
-  assert.equal(w.order(o.id).status, 'pending');
-  matchPending(w.db, Date.UTC(2026, 5, 7, 22, 0, 30));
-  assert.equal(w.order(o.id).status, 'filled', 'filled as soon as Sunday trading starts');
+  const w = await world();
+  const o = (await w.place({ symbol: 'EURUSD', side: 'buy', type: 'market', quantity: 3000 }, SAT)).order;
+  await matchPending(w.db, SAT + 12 * HOUR);
+  assert.equal((await w.order(o.id)).status, 'pending');
+  await matchPending(w.db, Date.UTC(2026, 5, 7, 22, 0, 30));
+  assert.equal((await w.order(o.id)).status, 'filled', 'filled as soon as Sunday trading starts');
 });
 
 test('a closed market shows its closing price, frozen, and never moves until it reopens', () => {
@@ -472,21 +472,21 @@ test('price gaps: each session opens with its own repeatable jump, bounded by th
   assert.notEqual(fri, monOpen);
 });
 
-test('a stop-loss gaps through its price: it executes at the open, not at the stop', () => {
-  const w = world();
+test('a stop-loss gaps through its price: it executes at the open, not at the stop', async () => {
+  const w = await world();
   const aapl = asset('AAPL');
-  w.place({ symbol: 'AAPL', side: 'buy', type: 'market', quantity: 5 }, MON_OPEN);
-  matchPending(w.db, MON_OPEN + 4 * SEC);
+  await w.place({ symbol: 'AAPL', side: 'buy', type: 'market', quantity: 5 }, MON_OPEN);
+  await matchPending(w.db, MON_OPEN + 4 * SEC);
   const fri = Date.UTC(2026, 5, 12, 20, 0);
-  const stop = w.place({ symbol: 'AAPL', side: 'sell', type: 'stop_loss', quantity: 5, price: priceAt(aapl, fri) * 0.5 }, fri).order;
+  const stop = (await w.place({ symbol: 'AAPL', side: 'sell', type: 'stop_loss', quantity: 5, price: priceAt(aapl, fri) * 0.5 }, fri)).order;
   // Raise the stop above anything the next open could be, as if the price had gapped down through it overnight.
   const nextMon = Date.UTC(2026, 5, 15, 14, 31);
-  w.db.prepare('UPDATE orders SET price = ? WHERE id = ?').run(priceAt(aapl, nextMon) * 1.2, stop.id);
-  matchPending(w.db, Date.UTC(2026, 5, 13, 12));
-  assert.equal(w.order(stop.id).status, 'pending', 'cannot trigger while closed');
-  matchPending(w.db, nextMon);
-  const [f] = w.fills(stop.id);
-  assert.ok(f.price < w.order(stop.id).price, 'filled below the stop price');
+  await w.db.prepare('UPDATE orders SET price = ? WHERE id = ?').run(priceAt(aapl, nextMon) * 1.2, stop.id);
+  await matchPending(w.db, Date.UTC(2026, 5, 13, 12));
+  assert.equal((await w.order(stop.id)).status, 'pending', 'cannot trigger while closed');
+  await matchPending(w.db, nextMon);
+  const [f] = await w.fills(stop.id);
+  assert.ok(f.price < (await w.order(stop.id)).price, 'filled below the stop price');
   assert.ok(Math.abs(f.mid - priceAt(aapl, nextMon)) < 1e-9);
 });
 
@@ -518,10 +518,10 @@ test('quantity rules differ by market', () => {
   assert.equal(checkQuantity(custom, 10), null);
 });
 
-test('orders that break the quantity rules are refused with the rules attached', () => {
-  const w = world();
+test('orders that break the quantity rules are refused with the rules attached', async () => {
+  const w = await world();
   for (const [symbol, quantity, text] of [['AAPL', 2.5, /whole shares/], ['EURUSD', 1234, /lots of 1,000/], ['XAU', 0.001, /minimum/], ['BTC', 5000, /maximum/]]) {
-    assert.throws(() => w.place({ symbol, side: 'buy', type: 'market', quantity }, MON_OPEN), (e) => {
+    await assert.rejects(async () => await w.place({ symbol, side: 'buy', type: 'market', quantity }, MON_OPEN), (e) => {
       assert.ok(e instanceof OrderError);
       assert.equal(e.code, 'INVALID_QUANTITY');
       assert.match(e.message, text);
@@ -529,11 +529,11 @@ test('orders that break the quantity rules are refused with the rules attached',
       return true;
     }, symbol);
   }
-  assert.equal(w.db.prepare('SELECT COUNT(*) n FROM orders').get().n, 0);
+  assert.equal((await w.db.prepare('SELECT COUNT(*) n FROM orders').get()).n, 0);
 });
 
 test('quantity rules also reach the API: the quote carries them, and a bad quantity is a 400', async () => {
-  const db = openDb(':memory:');
+  const db = await openDb(':memory:');
   const server = createApp(db, { secret: 's', simulation: 'realistic', mailer: { send() {} } }).listen(0);
   try {
     const base = `http://localhost:${server.address().port}/api`;
@@ -559,14 +559,14 @@ test('quantity rules also reach the API: the quote carries them, and a bad quant
 
 // ------------------------------------------------------------------ funds
 
-test('cash is held back for the fee and worst-case slippage, so an order that only just fits is refused', () => {
-  const w = world('realistic', 1000);
+test('cash is held back for the fee and worst-case slippage, so an order that only just fits is refused', async () => {
+  const w = await world('realistic', 1000);
   const ask = bidAsk(asset('BTC'), priceAt(asset('BTC'), MON_OPEN)).ask;
   const quantity = Math.floor((999.9 / ask) * 1e5) / 1e5; // costs a hair under 1,000 at the ask
   assert.ok(quantity * ask < 1000);
-  assert.throws(() => w.place({ symbol: 'BTC', side: 'buy', type: 'market', quantity }, MON_OPEN), /Insufficient funds/);
-  const ideal = world('ideal', 1000);
-  assert.equal(ideal.place({ symbol: 'BTC', side: 'buy', type: 'market', quantity }, MON_OPEN).order.status, 'filled', 'the ideal profile has no such margin');
+  await assert.rejects(async () => await w.place({ symbol: 'BTC', side: 'buy', type: 'market', quantity }, MON_OPEN), /Insufficient funds/);
+  const ideal = await world('ideal', 1000);
+  assert.equal((await ideal.place({ symbol: 'BTC', side: 'buy', type: 'market', quantity }, MON_OPEN)).order.status, 'filled', 'the ideal profile has no such margin');
 });
 
 // ------------------------------------------------------------------ explanation
@@ -578,7 +578,7 @@ test('the simulation description explains that paper trading can differ from rea
   assert.equal(profile.categories.stocks.spreadBps, 4);
   assert.equal(profile.categories.forex.feeBps, 0);
   assert.match(profile.categories.stocks.quantity, /whole shares/);
-  const db = openDb(':memory:');
+  const db = await openDb(':memory:');
   const server = createApp(db, { secret: 's', simulation: 'realistic' }).listen(0);
   try {
     const base = `http://localhost:${server.address().port}/api`;
@@ -593,7 +593,7 @@ test('the simulation description explains that paper trading can differ from rea
 });
 
 test('the server asks for the realistic profile by default, and tests get the ideal one', async () => {
-  const db = openDb(':memory:');
+  const db = await openDb(':memory:');
   const s1 = createApp(db, { secret: 's' }).listen(0);
   try {
     assert.equal(describeProfile().name, 'ideal');

@@ -205,7 +205,7 @@ test('compare: both series start at 100 and the return matches the last point', 
 // ------------------------------------------------------------------ HTTP API
 
 async function setup() {
-  const db = openDb(':memory:');
+  const db = await openDb(':memory:');
   const server = createApp(db, { secret: 's', log: () => {} }).listen(0);
   const base = `http://localhost:${server.address().port}/api`;
   const make = async (email) => {

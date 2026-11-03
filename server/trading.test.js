@@ -5,7 +5,7 @@ import { createApp } from './src/app.js';
 import { code } from './src/totp.js';
 
 async function setup() {
-  const db = openDb(':memory:');
+  const db = await openDb(':memory:');
   const server = createApp(db, { secret: 's', log: () => {} }).listen(0);
   const base = `http://localhost:${server.address().port}/api`;
   let token;
@@ -62,7 +62,7 @@ test('wallet, KYC and admin approval', async () => {
     assert.equal((await call('POST', '/kyc', kyc)).status, 201);
     assert.equal((await call('POST', '/kyc', kyc)).status, 409);
     assert.equal((await call('GET', '/admin/stats')).status, 403);
-    db.prepare("UPDATE users SET role = 'admin'").run();
+    await db.prepare("UPDATE users SET role = 'admin'").run();
     const pending = (await call('GET', '/admin/kyc')).body.submissions;
     assert.equal((await call('POST', `/admin/kyc/${pending[0].id}/approve`)).status, 200);
     assert.equal((await call('POST', '/wallet/withdraw', { amount: 10 })).status, 202, 'a request, held until an administrator decides');

@@ -5,7 +5,7 @@ import { createApp } from './src/app.js';
 
 test('register, verify, login, me', async () => {
   const logs = [];
-  const server = createApp(openDb(':memory:'), { secret: 's', log: (m) => logs.push(m) }).listen(0);
+  const server = createApp(await openDb(':memory:'), { secret: 's', log: (m) => logs.push(m) }).listen(0);
   const base = `http://localhost:${server.address().port}/api/auth`;
   const post = (p, b) => fetch(base + p, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(b) });
   try {

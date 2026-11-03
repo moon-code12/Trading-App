@@ -13,7 +13,7 @@ const PHONE = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKi
 
 // A running app with a controllable clock and a recording mailer.
 async function setup(opts = {}) {
-  const db = openDb(':memory:');
+  const db = await openDb(':memory:');
   const clock = { t: Date.UTC(2026, 0, 1, 12, 0, 0) };
   const mails = [];
   const server = createApp(db, { secret: 's', now: () => clock.t, mailer: { send: (m) => mails.push(m) }, ...opts }).listen(0);
@@ -34,7 +34,7 @@ async function setup(opts = {}) {
   return { db, server, clock, mails, call, register, lastMail };
 }
 const tokenOf = (link) => new URL(link).searchParams.get('token');
-const login = (ctx, password = 'password1', extra = {}, opts) => ctx.call('POST', '/login', { email: 'a@x.com', password, ...extra }, opts);
+const login = async (ctx, password = 'password1', extra = {}, opts) => await ctx.call('POST', '/login', { email: 'a@x.com', password, ...extra }, opts);
 
 // ------------------------------------------------------------------ password reset
 
@@ -85,7 +85,7 @@ test('password reset: tokens are stored hashed, and unknown emails get the same 
     await ctx.register();
     const known = await ctx.call('POST', '/forgot-password', { email: 'a@x.com' });
     const reset = tokenOf(ctx.lastMail('password-reset').link);
-    const rows = ctx.db.prepare('SELECT * FROM password_resets').all();
+    const rows = await ctx.db.prepare('SELECT * FROM password_resets').all();
     assert.equal(rows.length, 1);
     assert.ok(!JSON.stringify(rows).includes(reset), 'the plain token is not in the database');
     assert.match(rows[0].token_hash, /^[0-9a-f]{64}$/);
@@ -213,7 +213,7 @@ test('new-device notification: sent for an unfamiliar device only', async () => 
     await login(ctx, 'password1', {}, { ua: PHONE, device: 'phone' });
     const mail = ctx.lastMail('new-device');
     assert.ok(mail && mail.to === 'a@x.com' && /Safari on iOS/.test(mail.text));
-    const notes = ctx.db.prepare("SELECT message FROM notifications WHERE kind = 'security' AND message LIKE 'New sign-in%'").all();
+    const notes = await ctx.db.prepare("SELECT message FROM notifications WHERE kind = 'security' AND message LIKE 'New sign-in%'").all();
     assert.equal(notes.length, 1);
     const count = ctx.mails.filter((m) => m.kind === 'new-device').length;
     await login(ctx, 'password1', {}, { ua: PHONE, device: 'phone' });
@@ -244,7 +244,7 @@ test('lockout: five failed logins lock the account, even for the right password,
 
     ctx.clock.t += 5 * MIN;
     assert.equal((await login(ctx, 'password1')).status, 200);
-    const reasons = ctx.db.prepare('SELECT reason FROM login_events WHERE success = 0').all().map((r) => r.reason);
+    const reasons = (await ctx.db.prepare('SELECT reason FROM login_events WHERE success = 0').all()).map((r) => r.reason);
     assert.ok(reasons.includes('locked'));
   } finally { ctx.server.close(); }
 });
@@ -292,7 +292,7 @@ test('recovery codes: issued once when two-factor is enabled, stored only as has
     assert.equal(codes.length, 10);
     assert.equal(new Set(codes).size, 10);
     for (const c of codes) assert.match(c, /^[A-Z2-9]{5}-[A-Z2-9]{5}$/);
-    const stored = JSON.stringify(ctx.db.prepare('SELECT * FROM recovery_codes').all());
+    const stored = JSON.stringify(await ctx.db.prepare('SELECT * FROM recovery_codes').all());
     for (const c of codes) assert.ok(!stored.includes(c.replace('-', '')), 'no plain codes in the database');
     const status = await ctx.call('GET', '/2fa/recovery-codes', null, { token });
     assert.equal(status.body.remaining, 10);
@@ -307,7 +307,7 @@ test('recovery codes: each works once in place of an authenticator code', async 
     const used = await login(ctx, 'password1', { recoveryCode: codes[0].toLowerCase() }); // case and dash are forgiven
     assert.equal(used.status, 200);
     assert.equal(used.body.recoveryCodesRemaining, 9);
-    assert.ok(ctx.db.prepare("SELECT 1 FROM notifications WHERE message LIKE '%recovery code was used%'").get());
+    assert.ok(await ctx.db.prepare("SELECT 1 FROM notifications WHERE message LIKE '%recovery code was used%'").get());
     assert.equal((await login(ctx, 'password1', { recoveryCode: codes[0] })).status, 401, 'already used');
     assert.equal((await login(ctx, 'password1', { recoveryCode: codes[1].replace('-', '') })).status, 200);
     assert.equal((await login(ctx, 'password1', { recoveryCode: 'AAAAA-BBBBB' })).status, 401);
@@ -349,7 +349,7 @@ test('recovery codes: can switch two-factor off, which also deletes them; none w
     const { token, codes } = await withTwoFactor(ctx);
     assert.equal((await ctx.call('POST', '/2fa/disable', { recoveryCode: 'AAAAA-BBBBB' }, { token })).status, 400);
     assert.equal((await ctx.call('POST', '/2fa/disable', { recoveryCode: codes[0] }, { token })).status, 200);
-    assert.equal(ctx.db.prepare('SELECT COUNT(*) n FROM recovery_codes').get().n, 0);
+    assert.equal((await ctx.db.prepare('SELECT COUNT(*) n FROM recovery_codes').get()).n, 0);
     assert.equal((await ctx.call('GET', '/2fa/recovery-codes', null, { token })).status, 409);
     assert.equal((await login(ctx)).status, 200, 'no second factor needed any more');
   } finally { ctx.server.close(); }
@@ -403,9 +403,9 @@ test('no response contains password hashes, TOTP secrets, reset-token hashes or 
   try {
     const { token } = await withTwoFactor(ctx);
     await ctx.call('POST', '/forgot-password', { email: 'a@x.com' });
-    const secrets = ctx.db.prepare('SELECT password_hash, totp_secret FROM users').get();
-    const resetHash = ctx.db.prepare('SELECT token_hash FROM password_resets').get().token_hash;
-    const codeHashes = ctx.db.prepare('SELECT code_hash FROM recovery_codes').all().map((r) => r.code_hash);
+    const secrets = await ctx.db.prepare('SELECT password_hash, totp_secret FROM users').get();
+    const resetHash = (await ctx.db.prepare('SELECT token_hash FROM password_resets').get()).token_hash;
+    const codeHashes = (await ctx.db.prepare('SELECT code_hash FROM recovery_codes').all()).map((r) => r.code_hash);
     const forbidden = [secrets.password_hash, secrets.totp_secret, resetHash, ...codeHashes];
     const responses = [
       await ctx.call('GET', '/me', null, { token }),
@@ -446,7 +446,7 @@ test('mail: the console mailer prints the link, and a failing provider never bre
 
 test('mail: with no mailer given, emails go to the log function', async () => {
   const logs = [];
-  const server = createApp(openDb(':memory:'), { secret: 's', log: (m) => logs.push(m) }).listen(0);
+  const server = createApp(await openDb(':memory:'), { secret: 's', log: (m) => logs.push(m) }).listen(0);
   try {
     const base = `http://localhost:${server.address().port}/api/auth`;
     const post = (p, b) => fetch(base + p, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(b) });

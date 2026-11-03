@@ -43,10 +43,10 @@ export function replayFills(fills) {
 }
 
 // Loads the ledger as time-ordered events: cash changes and share-quantity changes.
-function loadLedger(db, user) {
-  const row = db.prepare('SELECT balance, created_at FROM users WHERE id = ?').get(user.id);
-  const fills = db.prepare('SELECT id, order_id, symbol, side, quantity, price, fee, filled_at FROM fills WHERE user_id = ? ORDER BY filled_at, id').all(user.id);
-  const txs = db.prepare('SELECT * FROM transactions WHERE user_id = ? ORDER BY id').all(user.id);
+async function loadLedger(db, user) {
+  const row = await db.prepare('SELECT balance, created_at FROM users WHERE id = ?').get(user.id);
+  const fills = await db.prepare('SELECT id, order_id, symbol, side, quantity, price, fee, filled_at FROM fills WHERE user_id = ? ORDER BY filled_at, id').all(user.id);
+  const txs = await db.prepare('SELECT * FROM transactions WHERE user_id = ? ORDER BY id').all(user.id);
   const fillById = new Map(fills.map((f) => [f.id, f]));
 
   // The opening balance is whatever the ledger does not explain (demo accounts start with 10,000).
@@ -108,8 +108,8 @@ function periodFrom(ledger, from, now) {
   };
 }
 
-export function computeAnalytics(db, user, now = Date.now()) {
-  const ledger = loadLedger(db, user);
+export async function computeAnalytics(db, user, now = Date.now()) {
+  const ledger = await loadLedger(db, user);
   const { positions, realized, realizedBySymbol } = replayFills(ledger.fills.map((f) => ({ ...f })));
   const cash = ledger.initialCash + ledger.events.reduce((s, e) => s + e.cash, 0);
 
@@ -171,8 +171,8 @@ const csvText = (v) => {
 };
 const csvNum = (n) => (n === null || n === undefined ? '' : String(n));
 
-export function buildStatement(db, user) {
-  const ledger = loadLedger(db, user);
+export async function buildStatement(db, user) {
+  const ledger = await loadLedger(db, user);
   const { realizedByOrder: realizedByFill } = replayFills(ledger.fills.map((f) => ({ ...f })));
   const fillById = new Map(ledger.fills.map((f) => [f.id, f]));
   const head = ['date_utc', 'type', 'symbol', 'quantity', 'price', 'amount', 'realized_pnl', 'balance_after', 'description', 'mode'];
@@ -195,8 +195,8 @@ export function buildStatement(db, user) {
 }
 
 // Equity change since `from` with deposits and withdrawals stripped out (used by the daily loss limit).
-export function performanceSince(db, user, from, now = Date.now()) {
-  const p = periodFrom(loadLedger(db, user), from, now);
+export async function performanceSince(db, user, from, now = Date.now()) {
+  const p = periodFrom(await loadLedger(db, user), from, now);
   return { pnl: p.pnl, returnPct: p.returnPct, startValue: p.startValue, endValue: p.endValue };
 }
 
@@ -206,8 +206,8 @@ export function performanceSince(db, user, from, now = Date.now()) {
 //              whenever it happens. (Dividing profit by "start plus deposits" would let a late deposit hide a loss.)
 //   pnl        what trading made or lost: end value minus start value minus net deposits.
 // Everything that is not a deposit or withdrawal (trades, fees) counts.
-export function timeWeightedPerformance(db, user, from, to) {
-  const ledger = loadLedger(db, user);
+export async function timeWeightedPerformance(db, user, from, to) {
+  const ledger = await loadLedger(db, user);
   const start = Math.max(from, ledger.createdAt);
   const end = Math.max(to, start);
   const flows = ledger.events.filter((e) => e.flow !== 0 && e.t > start && e.t <= end);

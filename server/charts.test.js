@@ -100,7 +100,7 @@ test('closes: the visible part equals the candles\' own closes and the history b
 // ------------------------------------------------------------------ HTTP: candles and indicators
 
 async function setup() {
-  const db = openDb(':memory:');
+  const db = await openDb(':memory:');
   const server = createApp(db, { secret: 's', log: () => {} }).listen(0);
   const base = `http://localhost:${server.address().port}/api`;
   const reg = await (await fetch(`${base}/auth/register`, {

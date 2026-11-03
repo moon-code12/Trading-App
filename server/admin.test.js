@@ -11,7 +11,7 @@ const MIN = 60e3;
 
 // An app with a controllable clock, one administrator and any number of ordinary users.
 async function setup() {
-  const db = openDb(':memory:');
+  const db = await openDb(':memory:');
   const clock = { t: Date.UTC(2026, 5, 1, 12, 0, 0) };
   const mails = [];
   const server = createApp(db, { secret: 's', now: () => clock.t, mailer: { send: (m) => mails.push(m) } }).listen(0);
@@ -30,11 +30,11 @@ async function setup() {
     return { token: r.body.token, id: r.body.user.id, email };
   };
   const admin = await signUp('Ada Admin', 'ada@x.com');
-  db.prepare("UPDATE users SET role = 'admin', email_verified = 1 WHERE id = ?").run(admin.id);
+  await db.prepare("UPDATE users SET role = 'admin', email_verified = 1 WHERE id = ?").run(admin.id);
   return { db, server, clock, mails, call, signUp, admin, close: () => server.close() };
 }
-const audit = (ctx, query = '') => ctx.call('GET', `/admin/audit${query}`, null, ctx.admin.token).then((r) => r.body);
-const pend = (ctx, user) => ctx.call('POST', '/orders', { symbol: 'ETH', side: 'buy', type: 'limit', quantity: 1, price: 1 }, user.token);
+const audit = async (ctx, query = '') => (await ctx.call('GET', `/admin/audit${query}`, null, ctx.admin.token)).body;
+const pend = async (ctx, user) => await ctx.call('POST', '/orders', { symbol: 'ETH', side: 'buy', type: 'limit', quantity: 1, price: 1 }, user.token);
 
 // ------------------------------------------------------------------ authorization
 
@@ -65,7 +65,7 @@ test('a signed-in user who is demoted loses admin access immediately', async () 
   const ctx = await setup();
   try {
     assert.equal((await ctx.call('GET', '/admin/stats', null, ctx.admin.token)).status, 200);
-    ctx.db.prepare("UPDATE users SET role = 'user' WHERE id = ?").run(ctx.admin.id);
+    await ctx.db.prepare("UPDATE users SET role = 'user' WHERE id = ?").run(ctx.admin.id);
     assert.equal((await ctx.call('GET', '/admin/stats', null, ctx.admin.token)).status, 403);
   } finally { ctx.close(); }
 });
@@ -78,8 +78,8 @@ test('user search: by name, email or id, with filters, sorting and paging', asyn
     const bob = await ctx.signUp('Bob Builder', 'bob@x.com');
     const cat = await ctx.signUp('Cat 100%', 'cat@y.org');
     await ctx.signUp('Dan', 'dan@y.org');
-    ctx.db.prepare("UPDATE users SET kyc_status = 'approved', balance = 50 WHERE id = ?").run(bob.id);
-    ctx.db.prepare('UPDATE users SET suspended_at = 1 WHERE id = ?').run(cat.id);
+    await ctx.db.prepare("UPDATE users SET kyc_status = 'approved', balance = 50 WHERE id = ?").run(bob.id);
+    await ctx.db.prepare('UPDATE users SET suspended_at = 1 WHERE id = ?').run(cat.id);
     const list = async (q) => (await ctx.call('GET', `/admin/users${q}`, null, ctx.admin.token)).body;
 
     assert.equal((await list('')).total, 4);
@@ -100,7 +100,7 @@ test('user search: by name, email or id, with filters, sorting and paging', asyn
     for (const bad of ['?role=root', '?kyc=maybe', '?status=gone', '?verified=1', '?sort=password_hash', '?order=sideways']) {
       assert.equal((await ctx.call('GET', `/admin/users${bad}`, null, ctx.admin.token)).status, 400, bad);
     }
-    ctx.db.prepare('UPDATE users SET locked_until = ? WHERE id = ?').run(ctx.clock.t + MIN, bob.id);
+    await ctx.db.prepare('UPDATE users SET locked_until = ? WHERE id = ?').run(ctx.clock.t + MIN, bob.id);
     assert.deepEqual((await list('?status=locked')).users.map((u) => u.email), ['bob@x.com']);
   } finally { ctx.close(); }
 });
@@ -109,7 +109,7 @@ test('user details: summary, counts and history, with no secrets, and the view i
   const ctx = await setup();
   try {
     const bob = await ctx.signUp('Bob', 'bob@x.com');
-    ctx.db.prepare("UPDATE users SET totp_secret = 'JBSWY3DPEHPK3PXP', totp_enabled = 1 WHERE id = ?").run(bob.id);
+    await ctx.db.prepare("UPDATE users SET totp_secret = 'JBSWY3DPEHPK3PXP', totp_enabled = 1 WHERE id = ?").run(bob.id);
     await pend(ctx, bob);
     await ctx.call('POST', '/auth/login', { email: 'bob@x.com', password: 'wrong' });
     const res = await ctx.call('GET', `/admin/users/${bob.id}`, null, ctx.admin.token);
@@ -153,7 +153,7 @@ test('suspended users cannot trade, withdraw or deposit, and pending orders stay
   const ctx = await setup();
   try {
     const bob = await ctx.signUp('Bob', 'bob@x.com');
-    ctx.db.prepare("UPDATE users SET kyc_status = 'approved' WHERE id = ?").run(bob.id);
+    await ctx.db.prepare("UPDATE users SET kyc_status = 'approved' WHERE id = ?").run(bob.id);
     const resting = (await pend(ctx, bob)).body.order;
     assert.equal(resting.status, 'pending');
 
@@ -173,9 +173,9 @@ test('suspended users cannot trade, withdraw or deposit, and pending orders stay
     assert.equal((await ctx.call('GET', '/wallet', null, bob.token)).body.balance, 10000, 'balance untouched');
 
     // The resting order would fill if its price were reached, but nothing is processed while suspended.
-    ctx.db.prepare('UPDATE orders SET price = 1000000 WHERE id = ?').run(resting.id);
-    matchPending(ctx.db);
-    assert.equal(ctx.db.prepare('SELECT status FROM orders WHERE id = ?').get(resting.id).status, 'pending');
+    await ctx.db.prepare('UPDATE orders SET price = 1000000 WHERE id = ?').run(resting.id);
+    await matchPending(ctx.db);
+    assert.equal((await ctx.db.prepare('SELECT status FROM orders WHERE id = ?').get(resting.id)).status, 'pending');
     assert.equal((await ctx.call('DELETE', `/orders/${resting.id}`, null, bob.token)).status, 200, 'they can still cancel');
 
     assert.equal((await ctx.call('POST', `/admin/users/${bob.id}/restore`, null, ctx.admin.token)).status, 200);
@@ -191,12 +191,12 @@ test('suspended: a resting order fills after restore', async () => {
     const bob = await ctx.signUp('Bob', 'bob@x.com');
     const resting = (await pend(ctx, bob)).body.order;
     await ctx.call('POST', `/admin/users/${bob.id}/suspend`, { reason: 'Review' }, ctx.admin.token);
-    ctx.db.prepare('UPDATE orders SET price = 1000000 WHERE id = ?').run(resting.id);
-    matchPending(ctx.db);
-    assert.equal(ctx.db.prepare('SELECT status FROM orders WHERE id = ?').get(resting.id).status, 'pending');
+    await ctx.db.prepare('UPDATE orders SET price = 1000000 WHERE id = ?').run(resting.id);
+    await matchPending(ctx.db);
+    assert.equal((await ctx.db.prepare('SELECT status FROM orders WHERE id = ?').get(resting.id)).status, 'pending');
     await ctx.call('POST', `/admin/users/${bob.id}/restore`, null, ctx.admin.token);
-    matchPending(ctx.db);
-    assert.notEqual(ctx.db.prepare('SELECT status FROM orders WHERE id = ?').get(resting.id).status, 'pending');
+    await matchPending(ctx.db);
+    assert.notEqual((await ctx.db.prepare('SELECT status FROM orders WHERE id = ?').get(resting.id)).status, 'pending');
   } finally { ctx.close(); }
 });
 
@@ -204,7 +204,7 @@ test('suspend and restore: rules, notifications and audit entries', async () => 
   const ctx = await setup();
   try {
     const bob = await ctx.signUp('Bob', 'bob@x.com');
-    const suspend = (id, reason) => ctx.call('POST', `/admin/users/${id}/suspend`, reason === undefined ? {} : { reason }, ctx.admin.token);
+    const suspend = async (id, reason) => await ctx.call('POST', `/admin/users/${id}/suspend`, reason === undefined ? {} : { reason }, ctx.admin.token);
     assert.equal((await suspend(bob.id)).status, 400, 'a reason is required');
     assert.equal((await suspend(bob.id, 'x')).status, 400);
     assert.equal((await suspend(ctx.admin.id, 'oops')).status, 409, 'administrators cannot be suspended');
@@ -212,7 +212,7 @@ test('suspend and restore: rules, notifications and audit entries', async () => 
     assert.equal((await ctx.call('POST', `/admin/users/${bob.id}/restore`, null, ctx.admin.token)).status, 409, 'not suspended yet');
     assert.equal((await suspend(bob.id, 'Chargeback fraud')).status, 200);
     assert.equal((await suspend(bob.id, 'again')).status, 409);
-    assert.ok(ctx.db.prepare("SELECT 1 FROM notifications WHERE user_id = ? AND message LIKE '%suspended%'").get(bob.id));
+    assert.ok(await ctx.db.prepare("SELECT 1 FROM notifications WHERE user_id = ? AND message LIKE '%suspended%'").get(bob.id));
     ctx.clock.t += 5 * MIN;
     await ctx.call('POST', `/admin/users/${bob.id}/restore`, null, ctx.admin.token);
 
@@ -236,20 +236,20 @@ test('reset balance: sets the amount, records the difference, and needs a reason
   try {
     const bob = await ctx.signUp('Bob', 'bob@x.com');
     await ctx.call('POST', '/orders', { symbol: 'ETH', side: 'buy', type: 'market', quantity: 1 }, bob.token);
-    const reset = (body) => ctx.call('POST', `/admin/users/${bob.id}/reset-balance`, body, ctx.admin.token);
+    const reset = async (body) => await ctx.call('POST', `/admin/users/${bob.id}/reset-balance`, body, ctx.admin.token);
     assert.equal((await reset({})).status, 400);
     assert.equal((await reset({ amount: -5, reason: 'bad' })).status, 400);
     assert.equal((await reset({ amount: 'lots', reason: 'bad' })).status, 400);
-    const before = ctx.db.prepare('SELECT balance FROM users WHERE id = ?').get(bob.id).balance;
+    const before = (await ctx.db.prepare('SELECT balance FROM users WHERE id = ?').get(bob.id)).balance;
     assert.ok(before < 10000);
     const res = await reset({ reason: 'Back to the starting balance' });
     assert.equal(res.status, 200);
     assert.equal(res.body.user.balance, 10000, 'defaults to the standard demo balance');
-    const tx = ctx.db.prepare("SELECT * FROM transactions WHERE note LIKE '%reset by an administrator%'").get();
+    const tx = await ctx.db.prepare("SELECT * FROM transactions WHERE note LIKE '%reset by an administrator%'").get();
     assert.equal(tx.type, 'deposit');
     assert.equal(tx.amount, Math.round((10000 - before) * 100) / 100);
     assert.equal((await reset({ amount: 250.5, reason: 'Lower it' })).body.user.balance, 250.5);
-    const down = ctx.db.prepare("SELECT * FROM transactions WHERE type = 'withdrawal' ORDER BY id DESC").get();
+    const down = await ctx.db.prepare("SELECT * FROM transactions WHERE type = 'withdrawal' ORDER BY id DESC").get();
     assert.equal(down.amount, -9749.5);
     const entry = (await audit(ctx, '?action=user.reset_balance')).entries[0];
     assert.deepEqual(entry.details, { from: 10000, to: 250.5, reason: 'Lower it' });
@@ -261,7 +261,7 @@ test('reset balance: sets the amount, records the difference, and needs a reason
 async function withdrawalSetup() {
   const ctx = await setup();
   const bob = await ctx.signUp('Bob', 'bob@x.com');
-  ctx.db.prepare("UPDATE users SET kyc_status = 'approved' WHERE id = ?").run(bob.id);
+  await ctx.db.prepare("UPDATE users SET kyc_status = 'approved' WHERE id = ?").run(bob.id);
   return { ctx, bob };
 }
 
@@ -285,7 +285,7 @@ test('withdrawal requests: held when asked for, listed for review, and approved'
     assert.equal((await ctx.call('GET', '/wallet', null, bob.token)).body.balance, 9600, 'stays withdrawn');
     assert.equal((await ctx.call('POST', `/admin/withdrawals/${req.body.id}/approve`, {}, ctx.admin.token)).status, 409, 'decided once');
     assert.equal((await ctx.call('POST', `/admin/withdrawals/${req.body.id}/reject`, { note: 'x' }, ctx.admin.token)).status, 409);
-    assert.ok(ctx.db.prepare("SELECT 1 FROM notifications WHERE user_id = ? AND message LIKE '%approved%'").get(bob.id));
+    assert.ok(await ctx.db.prepare("SELECT 1 FROM notifications WHERE user_id = ? AND message LIKE '%approved%'").get(bob.id));
     const entry = (await audit(ctx, '?action=withdrawal.approve')).entries[0];
     assert.deepEqual(entry.details, { withdrawalId: req.body.id, amount: 400, note: 'Checked' });
     assert.equal(entry.targetId, String(bob.id));
@@ -301,7 +301,7 @@ test('withdrawal requests: rejecting returns the money, and needs a reason', asy
     assert.equal((await ctx.call('GET', '/wallet', null, bob.token)).body.balance, 10000);
     const note = (await ctx.call('GET', '/wallet/withdrawals', null, bob.token)).body.withdrawals[0];
     assert.deepEqual([note.status, note.note], ['rejected', 'Name does not match']);
-    assert.ok(ctx.db.prepare("SELECT 1 FROM transactions WHERE user_id = ? AND note LIKE '%rejected, funds returned%'").get(bob.id));
+    assert.ok(await ctx.db.prepare("SELECT 1 FROM transactions WHERE user_id = ? AND note LIKE '%rejected, funds returned%'").get(bob.id));
     assert.equal((await ctx.call('POST', '/admin/withdrawals/999/approve', {}, ctx.admin.token)).status, 404);
     assert.equal((await ctx.call('GET', '/admin/withdrawals?status=bogus', null, ctx.admin.token)).status, 400);
   } finally { ctx.close(); }
@@ -326,13 +326,13 @@ test('failed logins: listed with filters, including emails that have no account'
   const ctx = await setup();
   try {
     const bob = await ctx.signUp('Bob', 'bob@x.com');
-    const login = (email, password) => ctx.call('POST', '/auth/login', { email, password });
+    const login = async (email, password) => await ctx.call('POST', '/auth/login', { email, password });
     await login('bob@x.com', 'nope');
     await login('ghost@x.com', 'nope');
     await login('bob@x.com', 'password1');
     ctx.clock.t += 10 * MIN;
     await login('bob@x.com', 'nope2');
-    const get = (q = '') => ctx.call('GET', `/admin/failed-logins${q}`, null, ctx.admin.token).then((r) => r.body);
+    const get = async (q = '') => (await ctx.call('GET', `/admin/failed-logins${q}`, null, ctx.admin.token)).body;
     const all = await get();
     assert.equal(all.total, 3, 'successful logins are not included');
     assert.deepEqual(all.attempts.map((a) => [a.email, a.accountExists]), [['bob@x.com', true], ['ghost@x.com', false], ['bob@x.com', true]]);
@@ -355,7 +355,7 @@ test('announcements: created by admins, shown to users until switched off or exp
   const ctx = await setup();
   try {
     const bob = await ctx.signUp('Bob', 'bob@x.com');
-    const post = (body) => ctx.call('POST', '/admin/announcements', body, ctx.admin.token);
+    const post = async (body) => await ctx.call('POST', '/admin/announcements', body, ctx.admin.token);
     assert.equal((await post({ title: '', message: 'x' })).status, 400);
     assert.equal((await post({ title: 'x', message: 'y', level: 'loud' })).status, 400);
     assert.equal((await post({ title: 'x', message: 'y', expiresAt: '2020-01-01T00:00:00Z' })).status, 400, 'expiry in the past');
@@ -383,7 +383,7 @@ test('assets: pausing blocks trading in one asset and shows it as paused, resumi
   try {
     const bob = await ctx.signUp('Bob', 'bob@x.com');
     const buy = { symbol: 'WTI', side: 'buy', type: 'market', quantity: 1 };
-    const patch = (status, reason) => ctx.call('PATCH', '/admin/assets/WTI', { status, reason }, ctx.admin.token);
+    const patch = async (status, reason) => await ctx.call('PATCH', '/admin/assets/WTI', { status, reason }, ctx.admin.token);
     assert.equal((await patch('paused', 'Data issue')).status, 200);
     assert.equal((await patch('paused')).status, 409, 'already paused');
     const blocked = await ctx.call('POST', '/orders', buy, bob.token);
@@ -414,9 +414,9 @@ test('assets: disabling hides it from the markets, blocks orders, and keeps exis
     const holdings = (await ctx.call('GET', '/portfolio', null, bob.token)).body.holdings;
     assert.equal(holdings[0].symbol, 'SOL');
     assert.ok(holdings[0].value > 0, 'still priced');
-    ctx.db.prepare('UPDATE orders SET price = 1000000 WHERE id = ?').run(resting.id);
-    matchPending(ctx.db);
-    assert.equal(ctx.db.prepare('SELECT status FROM orders WHERE id = ?').get(resting.id).status, 'pending', 'no fills while disabled');
+    await ctx.db.prepare('UPDATE orders SET price = 1000000 WHERE id = ?').run(resting.id);
+    await matchPending(ctx.db);
+    assert.equal((await ctx.db.prepare('SELECT status FROM orders WHERE id = ?').get(resting.id)).status, 'pending', 'no fills while disabled');
     const admin = (await ctx.call('GET', '/admin/assets', null, ctx.admin.token)).body.assets;
     assert.equal(admin.find((a) => a.symbol === 'SOL').status, 'disabled', 'administrators still see it');
     await ctx.call('PATCH', '/admin/assets/SOL', { status: 'active' }, ctx.admin.token);
@@ -449,6 +449,7 @@ test('assets: a new asset can be added, traded, and survives a restart; bad defi
     ASSETS.splice(index, 1); // as if the process had just started
     const again = createApp(ctx.db, { secret: 's' }).listen(0);
     try {
+      await fetch(`http://localhost:${again.address().port}/api/health`); // the catalogue reloads in the background; requests wait for it
       const reloaded = ASSETS.find((a) => a.symbol === 'ZZT');
       assert.equal(reloaded.name, 'Zed Test Coin');
       assert.equal(reloaded.status, 'paused');
@@ -492,8 +493,8 @@ test('audit log: cannot be edited or deleted, even directly in the database', as
   const ctx = await setup();
   try {
     await ctx.call('GET', `/admin/users/${ctx.admin.id}`, null, ctx.admin.token);
-    assert.throws(() => ctx.db.prepare("UPDATE admin_audit SET action = 'nothing'").run(), /append-only/);
-    assert.throws(() => ctx.db.prepare('DELETE FROM admin_audit').run(), /append-only/);
+    await assert.rejects(async () => await ctx.db.prepare("UPDATE admin_audit SET action = 'nothing'").run(), /append-only/);
+    await assert.rejects(async () => await ctx.db.prepare('DELETE FROM admin_audit').run(), /append-only/);
     assert.equal((await audit(ctx)).total, 1);
   } finally { ctx.close(); }
 });
@@ -521,23 +522,23 @@ test('audit log: every administrator action leaves an entry (who, what, target, 
   const ctx = await setup();
   try {
     const bob = await ctx.signUp('Bob', 'bob@x.com');
-    ctx.db.prepare("UPDATE users SET kyc_status = 'approved' WHERE id = ?").run(bob.id);
+    await ctx.db.prepare("UPDATE users SET kyc_status = 'approved' WHERE id = ?").run(bob.id);
     const { body: { id: wid } } = await ctx.call('POST', '/wallet/withdraw', { amount: 5 }, bob.token);
     const a = ctx.admin.token;
     const actions = [
-      () => ctx.call('GET', `/admin/users/${bob.id}`, null, a),
-      () => ctx.call('GET', `/admin/users/${bob.id}/portfolio`, null, a),
-      () => ctx.call('GET', `/admin/users/${bob.id}/orders`, null, a),
-      () => ctx.call('POST', `/admin/users/${bob.id}/suspend`, { reason: 'Review' }, a),
-      () => ctx.call('POST', `/admin/users/${bob.id}/restore`, null, a),
-      () => ctx.call('POST', `/admin/users/${bob.id}/reset-balance`, { reason: 'Reset' }, a),
-      () => ctx.call('POST', `/admin/withdrawals/${wid}/approve`, {}, a),
-      () => ctx.call('GET', '/admin/failed-logins', null, a),
-      () => ctx.call('POST', '/admin/announcements', { title: 'Hi', message: 'There' }, a),
-      () => ctx.call('PATCH', '/admin/announcements/1', { active: false }, a),
-      () => ctx.call('PATCH', '/admin/assets/BTC', { status: 'paused' }, a),
-      () => ctx.call('POST', '/admin/assets', { symbol: 'AUD1', name: 'Audit Coin', category: 'crypto', base: 1, liquidity: 1, volume: 1, risk: 'low', session: 'always' }, a),
-      () => ctx.call('GET', '/admin/reports/users', null, a),
+      async () => await ctx.call('GET', `/admin/users/${bob.id}`, null, a),
+      async () => await ctx.call('GET', `/admin/users/${bob.id}/portfolio`, null, a),
+      async () => await ctx.call('GET', `/admin/users/${bob.id}/orders`, null, a),
+      async () => await ctx.call('POST', `/admin/users/${bob.id}/suspend`, { reason: 'Review' }, a),
+      async () => await ctx.call('POST', `/admin/users/${bob.id}/restore`, null, a),
+      async () => await ctx.call('POST', `/admin/users/${bob.id}/reset-balance`, { reason: 'Reset' }, a),
+      async () => await ctx.call('POST', `/admin/withdrawals/${wid}/approve`, {}, a),
+      async () => await ctx.call('GET', '/admin/failed-logins', null, a),
+      async () => await ctx.call('POST', '/admin/announcements', { title: 'Hi', message: 'There' }, a),
+      async () => await ctx.call('PATCH', '/admin/announcements/1', { active: false }, a),
+      async () => await ctx.call('PATCH', '/admin/assets/BTC', { status: 'paused' }, a),
+      async () => await ctx.call('POST', '/admin/assets', { symbol: 'AUD1', name: 'Audit Coin', category: 'crypto', base: 1, liquidity: 1, volume: 1, risk: 'low', session: 'always' }, a),
+      async () => await ctx.call('GET', '/admin/reports/users', null, a),
     ];
     let expected = 0;
     for (const act of actions) {
@@ -562,7 +563,7 @@ test('reports: CSV exports with correct content, safe cells, no secrets, and an 
   const ctx = await setup();
   try {
     const bob = await ctx.signUp('=HYPERLINK("http://evil")', 'bob@x.com');
-    ctx.db.prepare("UPDATE users SET totp_secret = 'JBSWY3DPEHPK3PXP' WHERE id = ?").run(bob.id);
+    await ctx.db.prepare("UPDATE users SET totp_secret = 'JBSWY3DPEHPK3PXP' WHERE id = ?").run(bob.id);
     await ctx.call('POST', '/auth/login', { email: 'bob@x.com', password: 'wrong' });
     for (const type of ['users', 'orders', 'withdrawals', 'failed-logins', 'audit', 'assets']) {
       const res = await ctx.call('GET', `/admin/reports/${type}`, null, ctx.admin.token);
