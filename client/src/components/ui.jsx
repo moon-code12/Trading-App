@@ -23,12 +23,33 @@ export const Button = ({ variant = 'primary', className = '', ...p }) => {
 
 const inputCls = 'w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 outline-none focus:border-emerald-500';
 
-export const Field = ({ label, ...p }) => (
-  <label className="block text-sm">
-    <span className="mb-1 block text-slate-400">{label}</span>
-    <input className={inputCls} {...p} />
-  </label>
-);
+export const Field = ({ label, type, ...p }) => {
+  const [show, setShow] = useState(false);
+  if (type !== 'password') {
+    return (
+      <label className="block text-sm">
+        <span className="mb-1 block text-slate-400">{label}</span>
+        <input className={inputCls} type={type} {...p} />
+      </label>
+    );
+  }
+  return (
+    <label className="block text-sm">
+      <span className="mb-1 block text-slate-400">{label}</span>
+      <div className="relative">
+        <input className={`${inputCls} pr-16`} type={show ? 'text' : 'password'} {...p} />
+        <button
+          type="button"
+          tabIndex={-1}
+          onClick={() => setShow((s) => !s)}
+          className="absolute inset-y-0 right-0 px-3 text-xs text-slate-400 hover:text-slate-200"
+        >
+          {show ? 'Hide' : 'Show'}
+        </button>
+      </div>
+    </label>
+  );
+};
 
 export const Select = ({ label, children, ...p }) => (
   <label className="block text-sm">

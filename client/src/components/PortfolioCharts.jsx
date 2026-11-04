@@ -1,5 +1,7 @@
 import { useState } from 'react';
 import { money } from '../api.js';
+import { pinSummary, seriesStats } from '../lib/chartAnalysis.js';
+import { StatGrid, Trend, fmtPct, spanText } from './SeriesInsights.jsx';
 
 const UP = '#34d399';
 const DOWN = '#fb7185';
@@ -20,6 +22,7 @@ const fmtTime = (t, spanMs) => {
 // Portfolio value over time. Colour follows whether the period ended up or down.
 export function ValueChart({ points }) {
   const [hover, setHover] = useState(null);
+  const [pins, setPins] = useState([]); // up to two clicked points to measure between
   if (!points?.length) return null;
   const vals = points.map((p) => p.value);
   const min = Math.min(...vals);
@@ -34,13 +37,18 @@ export function ValueChart({ points }) {
   const color = vals[vals.length - 1] >= vals[0] ? UP : DOWN;
   const line = points.map((p, i) => `${i ? 'L' : 'M'}${x(p.t).toFixed(1)},${y(p.value).toFixed(1)}`).join('');
   const area = `${line}L${x(points[points.length - 1].t)},${H - PAD.bottom}L${x(t0)},${H - PAD.bottom}Z`;
-  const move = (e) => {
+  const nearest = (e) => {
     const r = e.currentTarget.getBoundingClientRect();
     const rel = ((e.clientX - r.left) / r.width) * W;
     let best = 0;
     points.forEach((p, i) => { if (Math.abs(x(p.t) - rel) < Math.abs(x(points[best].t) - rel)) best = i; });
-    setHover(best);
+    return best;
   };
+  const move = (e) => setHover(nearest(e));
+  // Click two points to measure the move between them; a third click starts again.
+  const pin = (e) => { const i = nearest(e); setHover(i); setPins((p) => (p.length === 1 ? [p[0], i] : [i])); };
+  const stats = seriesStats(vals);
+  const m = pins.length === 2 ? pinSummary(points[pins[0]], points[pins[1]]) : null;
   const h = hover === null ? null : points[hover];
   return (
     <div>
@@ -49,9 +57,11 @@ export function ValueChart({ points }) {
         <span className="font-semibold text-slate-100">{money(h ? h.value : vals[vals.length - 1])}</span>
       </div>
       <svg viewBox={`0 0 ${W} ${H}`} className="w-full touch-none" role="img" aria-label="Portfolio value over time (demo)"
-        onPointerMove={move} onPointerLeave={() => setHover(null)}>
+        onPointerMove={move} onPointerDown={pin} onPointerLeave={() => setHover(null)}>
         <path d={area} fill={color} opacity="0.12" />
         <path d={line} fill="none" stroke={color} strokeWidth="2" strokeLinejoin="round" />
+        {pins.map((i) => <line key={i} x1={x(points[i].t)} x2={x(points[i].t)} y1={PAD.top} y2={H - PAD.bottom} stroke="#e2e8f0" strokeWidth="1.5" />)}
+        {m && <rect x={x(m.from.t)} y={PAD.top} width={x(m.to.t) - x(m.from.t)} height={H - PAD.top - PAD.bottom} fill="#e2e8f0" opacity="0.07" />}
         {h && <>
           <line x1={x(h.t)} x2={x(h.t)} y1={PAD.top} y2={H - PAD.bottom} stroke="#475569" strokeDasharray="3 3" />
           <circle cx={x(h.t)} cy={y(h.value)} r="4" fill={color} />
@@ -59,6 +69,26 @@ export function ValueChart({ points }) {
         <text x={PAD.left} y={H - 6} fontSize="11" fill="#94a3b8">{fmtTime(t0, span)}</text>
         <text x={W - PAD.right} y={H - 6} fontSize="11" fill="#94a3b8" textAnchor="end">{fmtTime(t0 + span, span)}</text>
       </svg>
+      <p className="mt-1 text-xs text-slate-500">Click two points on the chart to measure between them.</p>
+      {m && (
+        <div className="mt-2 flex flex-wrap items-center gap-x-4 rounded-md bg-slate-900 px-3 py-2 text-xs" data-testid="value-pins">
+          <span className="text-slate-400">Over {spanText(m.ms)}:</span>
+          <b style={{ color: m.delta >= 0 ? UP : DOWN }}>{m.delta >= 0 ? '+' : '-'}{money(Math.abs(m.delta))} ({fmtPct(m.pct)})</b>
+          <button type="button" onClick={() => setPins([])} className="ml-auto rounded bg-slate-800 px-2 py-0.5 text-slate-300 hover:bg-slate-700">Clear</button>
+        </div>
+      )}
+      {stats && (
+        <section className="mt-3 rounded-lg border border-slate-800 bg-slate-950/60 p-3" aria-label="Portfolio analysis" data-testid="value-analysis">
+          <div className="mb-2 flex flex-wrap items-center gap-2"><h3 className="text-sm font-semibold text-slate-100">Analysis</h3><Trend trend={stats.trend} /></div>
+          <StatGrid label="Portfolio statistics" items={[
+            ['Change', `${stats.change >= 0 ? '+' : '-'}${money(Math.abs(stats.change))} (${fmtPct(stats.changePct)})`, stats.change >= 0 ? UP : DOWN],
+            ['Highest / lowest value', `${money(stats.high)} / ${money(stats.low)}`],
+            ['Volatility', `${stats.volatility.toFixed(2)}% per step`],
+            ['Max drawdown', fmtPct(stats.drawdownPct), stats.drawdownPct < 0 ? DOWN : undefined],
+          ]} />
+          <p className="mt-2 text-[11px] text-slate-500">Demo figures, not financial advice.</p>
+        </section>
+      )}
     </div>
   );
 }
